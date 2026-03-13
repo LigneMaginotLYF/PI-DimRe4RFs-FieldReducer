@@ -234,7 +234,8 @@ class TrainingPipeline:
         Y_pred = reduced_lut.predict(xi_prime_pred)
 
         metrics = Validation.compute_metrics(Y_pred, Y_test)
-        logger.info(f"Test metrics: R²={metrics['r2']:.4f}, RMSE={metrics['rmse']:.4e}, relL2={metrics['rel_l2']:.4f}")
+        r2_str = f"{metrics['r2']:.4f}" if metrics['r2'] is not None else "N/A"
+        logger.info(f"Test metrics: R²={r2_str}, RMSE={metrics['rmse']:.4e}, relL2={metrics['rel_l2']:.4f}")
 
         metrics['run_id'] = run_id
         with open(os.path.join(self.output_dir, 'metrics.json'), 'w', encoding='utf-8') as f:

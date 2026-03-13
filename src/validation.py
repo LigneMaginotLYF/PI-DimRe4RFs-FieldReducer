@@ -17,7 +17,13 @@ class Validation:
         pred = np.atleast_2d(predictions)
         tgt = np.atleast_2d(targets)
 
-        r2 = float(r2_score(tgt, pred, multioutput='uniform_average'))
+        # R² requires at least 2 samples; return None if undefined
+        if len(tgt) < 2:
+            r2 = None
+        else:
+            r2_val = r2_score(tgt, pred, multioutput='uniform_average')
+            r2 = None if np.isnan(r2_val) else float(r2_val)
+
         rmse = float(np.sqrt(np.mean((pred - tgt) ** 2)))
 
         norms = np.linalg.norm(tgt, axis=1)
