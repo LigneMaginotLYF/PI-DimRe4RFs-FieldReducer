@@ -1,10 +1,56 @@
-# Master Configuration
+dataset:
+  n_samples: 500
+  n_kl_terms_E: 5
+  seed: 42
 
-# Dataset Configuration
-# Material Specification
-# Random Field Parameters
-# Solver Parameters
-# Dimension Reducer Specification
-# Reduced Lookup Table Parameters
-# Surrogate Model Parameters
-# Validation Parameters
+material:
+  E_ref: 10.0e6
+  permeability_ref: 1.0e-12
+  permeability_h: 1.0e-12
+  permeability_v: 1.0e-12
+  poisson_ratio: 0.3
+  biot_coefficient: 0.8
+  fluid_viscosity: 1.0e-3
+  porosity: 0.3
+  fluid_bulk_modulus: 2.2e9
+  applied_load: 1.0e6
+  pore_pressure_bottom: 1.0e5
+
+domain:
+  length_x: 1.0
+  length_z: 1.0
+
+solver:
+  type: "2d"
+  response_mode: "steady_state"
+  n_nodes_x: 20
+  n_nodes_z: 20
+
+random_field:
+  covariance: "matern"
+  nu_sampling: true
+  nu_range: [0.5, 2.5]
+  length_scale_sampling: true
+  length_scale_range: [0.1, 0.5]
+
+dimension_reducer:
+  d: 1
+  basis_type: "polynomial"
+  basis_order: 1
+
+reduced_lut:
+  n_grid_points: 2000
+  grid_type: "random"
+
+surrogate:
+  type: "nn"
+  hidden_dim: 64
+  n_blocks: 3
+  epochs: 200
+  learning_rate: 1.0e-3
+  batch_size: 64
+
+validation:
+  train_fraction: 0.6
+  val_fraction: 0.2
+  test_fraction: 0.2
