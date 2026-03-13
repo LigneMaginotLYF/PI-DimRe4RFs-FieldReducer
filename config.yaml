@@ -1,17 +1,10 @@
-# Configuration file for the FieldReducer project
+# Master Configuration
 
-# General settings
-setting1: value1
-setting2: value2
-
-# Model settings
-model:
-  type: "surrogate"
-  parameters:
-    param1: value1
-    param2: value2
-
-# Training settings
-training:
-  epochs: 100
-  batch_size: 32
+# Dataset Configuration
+# Material Specification
+# Random Field Parameters
+# Solver Parameters
+# Dimension Reducer Specification
+# Reduced Lookup Table Parameters
+# Surrogate Model Parameters
+# Validation Parameters

@@ -1,0 +1,6 @@
+# Default Stage 1 Configuration
+
+parameters:
+  d: 1
+  basis_order: 1
+  polynomial: true
