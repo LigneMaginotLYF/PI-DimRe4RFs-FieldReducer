@@ -2,6 +2,7 @@
 results/
 data/
 models/
+plots/
 
 # Python
 __pycache__/
