@@ -1,6 +1,17 @@
-# Default Stage 1 Configuration
+dataset:
+  n_samples: 500
+  n_kl_terms_E: 5
+  seed: 42
 
-parameters:
+dimension_reducer:
   d: 1
+  basis_type: "polynomial"
   basis_order: 1
-  polynomial: true
+
+surrogate:
+  type: "nn"
+  hidden_dim: 64
+  n_blocks: 3
+  epochs: 200
+  learning_rate: 1.0e-3
+  batch_size: 64
