@@ -1,0 +1,17 @@
+# Configuration file for the FieldReducer project
+
+# General settings
+setting1: value1
+setting2: value2
+
+# Model settings
+model:
+  type: "surrogate"
+  parameters:
+    param1: value1
+    param2: value2
+
+# Training settings
+training:
+  epochs: 100
+  batch_size: 32
