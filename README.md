@@ -12,5 +12,7 @@ This repository implements the PI-DimRe4RFs-FieldReducer, which includes a compl
 ## Requirements
 Install the required dependencies:
 ```bash
+git clone https://github.com/LigneMaginotLYF/PI-DimRe4RFs-FieldReducer
+cd PI-DimRe4RFs-FieldReducer
 pip install -r requirements.txt
 ```
