@@ -61,30 +61,3 @@ class ConfigManager:
             if r not in self.config:
                 raise ValueError(f"Missing required config section: {r}")
         return True
-
-    def _deep_merge(self, base, override):
-        result = base.copy()
-        for key, val in override.items():
-            if key in result and isinstance(result[key], dict) and isinstance(val, dict):
-                result[key] = self._deep_merge(result[key], val)
-            else:
-                result[key] = val
-        return result
-
-    def get(self, *keys, default=None):
-        """Get nested config value using multiple args."""
-        d = self.config
-        for k in keys:
-            if isinstance(d, dict) and k in d:
-                d = d[k]
-            else:
-                return default
-        return d
-
-    def validate(self):
-        """Basic validation of required config sections."""
-        required = ['dataset', 'material', 'solver']
-        for r in required:
-            if r not in self.config:
-                raise ValueError(f"Missing required config section: {r}")
-        return True

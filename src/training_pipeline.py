@@ -316,6 +316,17 @@ class TrainingPipeline:
         elif 4 in phases:
             X_test = np.load(os.path.join(self.data_dir, 'X_test.npy'))
             Y_test = np.load(os.path.join(self.data_dir, 'Y_test.npy'))
+            # Load saved reducer model
+            surr_type = self.config.get('surrogate', {}).get('type', 'nn')
+            if surr_type == 'nn':
+                import torch
+                reducer_path = os.path.join(self.models_dir, 'dimension_reducer_nn.pt')
+                reducer = torch.load(reducer_path, weights_only=False)
+            else:
+                import pickle
+                reducer_path = os.path.join(self.models_dir, 'dimension_reducer_pce.pkl')
+                with open(reducer_path, 'rb') as f:
+                    reducer = pickle.load(f)
 
         if 4 in phases:
             metrics = self.phase4_evaluate(reducer, reduced_lut, X_test, Y_test)
