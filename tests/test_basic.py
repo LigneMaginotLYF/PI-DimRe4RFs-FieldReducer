@@ -2,6 +2,9 @@ import unittest
 import numpy as np
 import sys
 import os
+import shutil
+import tempfile
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
@@ -13,6 +16,17 @@ class TestConfigManager(unittest.TestCase):
         self.assertIn('material', cm.config)
         self.assertIn('solver', cm.config)
 
+    def test_preset_merge(self):
+        """Preset overrides should merge correctly with base config."""
+        from src.config_manager import ConfigManager
+        cm = ConfigManager(
+            config_file='config.yaml',
+            preset_file='presets/stage1_d1_polynomial.yaml',
+        )
+        self.assertEqual(cm.config['dimension_reducer']['basis_type'], 'polynomial')
+        self.assertIn('dataset', cm.config)
+        self.assertIn('surrogate', cm.config)
+
     def test_deep_merge(self):
         from src.config_manager import ConfigManager
         cm = ConfigManager()
@@ -22,6 +36,15 @@ class TestConfigManager(unittest.TestCase):
         self.assertEqual(result['a']['b'], 10)
         self.assertEqual(result['a']['c'], 2)
         self.assertEqual(result['d'], 3)
+
+    def test_scientific_notation_coercion(self):
+        """Scientific notation strings should be coerced to float."""
+        from src.config_manager import ConfigManager
+        cm = ConfigManager()
+        result = cm._coerce_numeric_strings({'x': '1.0e6', 'y': '3e-12', 'z': 'abc'})
+        self.assertAlmostEqual(result['x'], 1.0e6)
+        self.assertAlmostEqual(result['y'], 3e-12)
+        self.assertEqual(result['z'], 'abc')
 
 
 class TestFieldGenerator(unittest.TestCase):
@@ -117,6 +140,129 @@ class TestValidation(unittest.TestCase):
         metrics = Validation.compute_metrics(Y_pred, Y)
         self.assertGreater(metrics['r2'], 0.5)
         self.assertGreater(metrics['rmse'], 0)
+
+
+def _make_smoke_config():
+    """Return a minimal config for fast smoke tests."""
+    return {
+        'dataset': {'n_samples': 8, 'n_kl_terms_E': 5, 'seed': 0},
+        'material': {
+            'E_ref': 10.0e6,
+            'permeability_ref': 1.0e-12,
+            'permeability_h': 1.0e-12,
+            'permeability_v': 1.0e-12,
+            'poisson_ratio': 0.3,
+            'biot_coefficient': 0.8,
+            'applied_load': 1.0e6,
+            'pore_pressure_bottom': 1.0e5,
+        },
+        'domain': {'length_x': 1.0, 'length_z': 1.0},
+        'solver': {'n_nodes_x': 8, 'n_nodes_z': 8},
+        'random_field': {
+            'nu_range': [0.5, 2.5],
+            'length_scale_range': [0.1, 0.5],
+        },
+        'dimension_reducer': {'d': 1, 'basis_type': 'polynomial', 'basis_order': 1},
+        'reduced_lut': {'n_grid_points': 15, 'grid_type': 'random'},
+        'surrogate': {
+            'type': 'pce',
+            'hidden_dim': 16,
+            'n_blocks': 1,
+            'epochs': 2,
+            'learning_rate': 1e-3,
+            'batch_size': 8,
+            'basis_order': 2,
+        },
+        'validation': {
+            'train_fraction': 0.6,
+            'val_fraction': 0.2,
+            'test_fraction': 0.2,
+        },
+    }
+
+
+class TestSmokeRun(unittest.TestCase):
+    """End-to-end smoke test with tiny settings to verify pipeline completes."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix='pi_dimre_smoke_')
+        # Redirect global artifact dirs to tmp so tests don't pollute cwd
+        self._orig_cwd = os.getcwd()
+        os.chdir(self.tmp_dir)
+
+    def tearDown(self):
+        os.chdir(self._orig_cwd)
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def test_full_pipeline_pce(self):
+        """PCE smoke run: all four phases complete and core artifacts are created."""
+        from src.training_pipeline import TrainingPipeline
+
+        config = _make_smoke_config()
+        pipeline = TrainingPipeline(config, output_dir='results/smoke_pce')
+        metrics = pipeline.orchestrate(phases=[1, 2, 3, 4])
+
+        # Core artifacts exist
+        self.assertTrue(os.path.exists('data/X_train.npy'))
+        self.assertTrue(os.path.exists('data/Y_train.npy'))
+        self.assertTrue(os.path.exists('data/lut_grid_points.npy'))
+        self.assertTrue(os.path.exists('data/lut_responses.npy'))
+        self.assertTrue(os.path.exists('models/reduced_lut/config.json'))
+        self.assertTrue(os.path.exists('models/reduced_lut/grid_points.npy'))
+        self.assertTrue(os.path.exists('models/reduced_lut/responses.npy'))
+        self.assertTrue(os.path.exists('models/reduced_lut/surrogate_pce.pkl'))
+        self.assertTrue(os.path.exists('models/dimension_reducer_pce.pkl'))
+        self.assertTrue(os.path.exists('results/smoke_pce/metrics.json'))
+        self.assertTrue(os.path.exists('results/smoke_pce/run_summary.txt'))
+
+        # Array shapes
+        X = np.load('data/X_train.npy')
+        Y = np.load('data/Y_train.npy')
+        self.assertEqual(X.shape, (8, 5))
+        self.assertEqual(Y.shape[0], 8)
+
+        # Metrics dict has expected keys
+        self.assertIn('r2', metrics)
+        self.assertIn('rmse', metrics)
+        self.assertIn('rel_l2', metrics)
+
+    def test_phase2_reuse(self):
+        """Phase 2 reuse: second run loads cached surrogate without recomputing."""
+        from src.training_pipeline import TrainingPipeline
+        import json
+
+        config = _make_smoke_config()
+        # First run: build and save
+        p1 = TrainingPipeline(config, output_dir='results/reuse_first')
+        p1.orchestrate(phases=[1, 2])
+
+        # Read the creation date from the first run's config.json
+        with open('models/reduced_lut/config.json') as f:
+            meta_first = json.load(f)
+
+        # Second run: should load cached surrogate (config.json unchanged)
+        p2 = TrainingPipeline(config, output_dir='results/reuse_second')
+        p2.orchestrate(phases=[2])
+
+        with open('models/reduced_lut/config.json') as f:
+            meta_second = json.load(f)
+
+        # The created_date should be unchanged (loaded, not regenerated)
+        self.assertEqual(meta_first['created_date'], meta_second['created_date'])
+
+    def test_full_pipeline_nn(self):
+        """NN smoke run: all four phases complete."""
+        from src.training_pipeline import TrainingPipeline
+
+        config = _make_smoke_config()
+        config['surrogate']['type'] = 'nn'
+        config['surrogate']['epochs'] = 2
+        pipeline = TrainingPipeline(config, output_dir='results/smoke_nn')
+        metrics = pipeline.orchestrate(phases=[1, 2, 3, 4])
+
+        self.assertTrue(os.path.exists('models/reduced_lut/surrogate_nn.pt'))
+        self.assertTrue(os.path.exists('models/dimension_reducer_nn.pt'))
+        self.assertIn('r2', metrics)
 
 
 if __name__ == '__main__':

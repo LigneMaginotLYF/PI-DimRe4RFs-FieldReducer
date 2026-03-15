@@ -22,10 +22,15 @@ class TrainingPipeline:
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
 
-        self.data_dir = os.path.join(output_dir, 'data')
-        self.models_dir = os.path.join(output_dir, 'models')
-        self.plots_dir = os.path.join(output_dir, 'plots')
-        for d in [self.data_dir, self.models_dir, self.plots_dir]:
+        # Global artifact directories (shared across runs for reuse)
+        self.data_dir = 'data'
+        self.models_dir = 'models'
+        self.plots_dir = 'plots'
+        for d in [self.data_dir, self.models_dir, self.plots_dir,
+                  os.path.join(self.plots_dir, 'material_fields'),
+                  os.path.join(self.plots_dir, 'settlement_comparison'),
+                  os.path.join(self.plots_dir, 'sensitivity'),
+                  os.path.join(self.plots_dir, 'aggregate')]:
             os.makedirs(d, exist_ok=True)
 
         self.timings = {}
@@ -97,9 +102,10 @@ class TrainingPipeline:
         logger.info(f"X_train: {X_train.shape}, Y_train: {Y_train.shape}")
         return X_train, Y_train
 
-    def phase2_build_reduced_surrogate(self, seed=None):
+    def phase2_build_reduced_surrogate(self, seed=None, force_recompute=False):
         """
         Build LUT, fit surrogate S: xi'->Y', save for reuse.
+        If surrogate artifacts already exist and force_recompute is False, loads them.
         Returns the fitted ReducedLUT object.
         """
         t0 = time.time()
@@ -120,6 +126,15 @@ class TrainingPipeline:
 
         from src.reduced_lut import ReducedLUT
         lut = ReducedLUT(self.config, solver, output_dir=lut_output_dir)
+
+        # Skip/reuse logic: load existing artifacts if present
+        config_path = os.path.join(lut_output_dir, 'config.json')
+        if not force_recompute and os.path.exists(config_path):
+            logger.info(f"Phase 2: Found existing surrogate at {lut_output_dir}, loading for reuse")
+            lut.load(surrogate_type=surrogate_type)
+            self.timings['phase2'] = time.time() - t0
+            logger.info(f"Phase 2 loaded from cache in {self.timings['phase2']:.1f}s")
+            return lut
 
         lut.generate_grid(seed=seed)
         lut.precompute_responses()
@@ -258,6 +273,16 @@ class TrainingPipeline:
             "=" * 60,
             f"Output dir: {self.output_dir}",
             "",
+            "Configuration:",
+        ]
+        for section, vals in self.config.items():
+            if isinstance(vals, dict):
+                items = ', '.join(f'{k}={v}' for k, v in vals.items())
+                summary_lines.append(f"  {section}: {{{items}}}")
+            else:
+                summary_lines.append(f"  {section}: {vals}")
+        summary_lines += [
+            "",
             "Phase timings:",
         ]
         for phase, t in self.timings.items():
@@ -274,10 +299,14 @@ class TrainingPipeline:
             ]
         summary_lines += [
             "",
-            "File locations:",
-            f"  Data: {self.data_dir}",
-            f"  Models: {self.models_dir}",
-            f"  Plots: {self.plots_dir}",
+            "Artifact locations:",
+            f"  Training data:    {self.data_dir}/X_train.npy, {self.data_dir}/Y_train.npy",
+            f"  LUT data:         {self.data_dir}/lut_grid_points.npy, {self.data_dir}/lut_responses.npy",
+            f"  Surrogate model:  {self.models_dir}/reduced_lut/",
+            f"  Reducer model:    {self.models_dir}/dimension_reducer_{{nn.pt,pce.pkl}}",
+            f"  Plots:            {self.plots_dir}/",
+            f"  Metrics:          {self.output_dir}/metrics.json",
+            f"  Run summary:      {self.output_dir}/run_summary.txt",
         ]
         with open(os.path.join(self.output_dir, 'run_summary.txt'), 'w', encoding='utf-8') as f:
             f.write('\n'.join(summary_lines))
