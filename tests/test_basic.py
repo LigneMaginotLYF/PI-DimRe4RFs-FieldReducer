@@ -89,14 +89,18 @@ class TestBiotSolver(unittest.TestCase):
         self.assertFalse(np.any(np.isnan(settlement)))
         self.assertTrue(np.all(settlement >= 0))
 
-    def test_permeability_effect(self):
-        """High k_h should give different settlement than low k_h."""
+    def test_uniform_settlement_with_constant_field(self):
+        """With constant E field and uniform top-drainage BCs, settlement should be
+        spatially uniform across x (1D vertical flow, no horizontal variation)."""
         from src.forward_solver_2d import BiotSolver2D
         solver = BiotSolver2D(self.config)
         E_field = np.full((10, 10), 10e6)
-        Y1 = solver.run(E_field, k_h=1e-12, k_v=1e-12)
-        Y2 = solver.run(E_field, k_h=1e-8, k_v=1e-12)
-        self.assertFalse(np.allclose(Y1, Y2))
+        settlement = solver.run(E_field, k_h=1e-12, k_v=1e-12)
+        self.assertEqual(settlement.shape, (10,))
+        # All x-nodes must have the same settlement (uniform BCs + uniform material)
+        self.assertTrue(np.allclose(settlement, settlement[0], rtol=1e-10, atol=0),
+                        "Settlement should be spatially uniform for a constant material field "
+                        "with fully uniform top-drainage boundary conditions.")
 
 
 class TestNNSurrogate(unittest.TestCase):

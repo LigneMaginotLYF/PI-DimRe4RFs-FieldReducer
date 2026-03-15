@@ -10,9 +10,9 @@ class BiotSolver2D:
     Flow equation: k_h * d²p/dx² + k_v * d²p/dz² = 0
 
     Boundary conditions:
-      - Bottom (z=0): p = p_bottom (water pressure source)
-      - Top center (x in [L/4, 3L/4]): p = 0 (drainage)
-      - All other boundaries: dp/dn = 0 (no-flow)
+      - Bottom (z=0): p = p_bottom (uniform fixed pressure)
+      - Top (z=L_z): p = 0 (fully permeable, all nodes drain)
+      - Left/Right sides: dp/dn = 0 (no-flow)
 
     Settlement: u_z(x) = sum_j [ (q - b*p[j,i]) / M_v[j,i] * dz ]
     """
@@ -34,9 +34,6 @@ class BiotSolver2D:
         self.dx = self.L_x / (self.n_x - 1)
         self.dz = self.L_z / (self.n_z - 1)
 
-        x_coords = np.linspace(0, self.L_x, self.n_x)
-        self._drainage_x_mask = (x_coords >= self.L_x / 4) & (x_coords <= 3 * self.L_x / 4)
-
     def _idx(self, i, j):
         """Linear index from (i=x-index, j=z-index)."""
         return j * self.n_x + i
@@ -57,13 +54,9 @@ class BiotSolver2D:
                     rows.append(row); cols.append(row); vals.append(1.0)
                     continue
 
-                if j == self.n_z - 1 and self._drainage_x_mask[i]:
-                    rows.append(row); cols.append(row); vals.append(1.0)
-                    continue
-
                 if j == self.n_z - 1:
+                    # Top surface: fully permeable (Dirichlet p=0 for all x nodes)
                     rows.append(row); cols.append(row); vals.append(1.0)
-                    rows.append(row); cols.append(self._idx(i, j - 1)); vals.append(-1.0)
                     continue
 
                 diag = 0.0
@@ -97,7 +90,7 @@ class BiotSolver2D:
                 row = self._idx(i, j)
                 if j == 0:
                     b[row] = self.p_bottom
-                elif j == self.n_z - 1 and self._drainage_x_mask[i]:
+                elif j == self.n_z - 1:
                     b[row] = 0.0
         return b
 
