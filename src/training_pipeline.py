@@ -312,11 +312,17 @@ class TrainingPipeline:
         output_dim = red_cfg.get('d', 1)  # output dimension matches reduced space
 
         reducers = {}
+        lut_output_dir = os.path.join(self.models_dir, 'reduced_lut')
         for r_type in reducer_types:
+            # Load the correct surrogate for this reducer type into a dedicated LUT instance
+            from src.reduced_lut import ReducedLUT
+            lut_for_type = ReducedLUT(self.config, self._get_solver(),
+                                      output_dir=lut_output_dir)
+            lut_for_type.load(surrogate_type=r_type)
             reducer = self._train_single_reducer(
                 r_type, input_dim, output_dim,
                 X_tr, Y_tr, X_val, Y_val,
-                surr_cfg, red_cfg, reduced_lut,
+                surr_cfg, red_cfg, lut_for_type,
             )
             reducers[r_type] = reducer
 
@@ -407,6 +413,13 @@ class TrainingPipeline:
         viz.plot_settlement_comparison(Y_test, Y_pred, n_samples=5)
         viz.plot_aggregate_metrics(Y_test, Y_pred)
         viz.plot_sobol_sensitivity(primary_reducer, input_dim=X_test.shape[1])
+
+        # Collocation point visualizations (when LUT has training indices)
+        if reduced_lut.train_indices is not None:
+            viz.plot_settlement_comparison_with_collocation(
+                Y_test, Y_pred, reduced_lut, n_samples=5
+            )
+            viz.plot_settlement_collocation_scatter(reduced_lut)
 
         # Material field comparison plots
         self._plot_material_field_comparison(

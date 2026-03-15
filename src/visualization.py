@@ -252,3 +252,92 @@ class Visualization:
         """Static method for backward compatibility."""
         viz = Visualization()
         viz.plot_material_fields(fields)
+
+    def plot_settlement_comparison_with_collocation(self, Y_original, Y_predicted,
+                                                     reduced_lut, n_samples=5):
+        """
+        Plot original vs predicted settlement profiles with collocation points overlay.
+
+        Args:
+            Y_original: Reference settlement profiles, shape (n_test, n_x)
+            Y_predicted: Predicted settlement profiles, shape (n_test, n_x)
+            reduced_lut: ReducedLUT object with grid_points, responses, train_indices
+            n_samples: Number of samples to plot
+        """
+        plt = self._get_plt()
+        n = min(n_samples, len(Y_original))
+        rng = np.random.default_rng(42)
+        indices = rng.choice(len(Y_original), size=n, replace=False)
+
+        fig, axes = plt.subplots(1, n, figsize=(5 * n, 4))
+        if n == 1:
+            axes = [axes]
+
+        train_indices = reduced_lut.train_indices
+        collocation_settlements = reduced_lut.responses[train_indices]
+
+        for ax, idx in zip(axes, indices):
+            x = np.arange(Y_original.shape[1])
+
+            ax.plot(x, Y_original[idx], 'b-', label='Original', linewidth=2.5)
+            ax.plot(x, Y_predicted[idx], 'r--', label='Reduced', linewidth=2.5)
+
+            n_colloc_show = min(20, len(collocation_settlements))
+            colloc_idx = rng.choice(len(collocation_settlements),
+                                    size=n_colloc_show, replace=False)
+            for c_idx in colloc_idx:
+                ax.plot(x, collocation_settlements[c_idx], 'go', alpha=0.3, markersize=4)
+
+            ax.plot([], [], 'go', alpha=0.5, markersize=6,
+                    label='Collocation points (training)')
+            ax.set_title(f'Sample {idx}')
+            ax.set_xlabel('x node')
+            ax.set_ylabel('Settlement [m]')
+            ax.legend(fontsize=9)
+            ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        path = os.path.join(self.plots_dir, 'settlement_comparison',
+                            'comparison_with_collocation.png')
+        plt.savefig(path, dpi=100, bbox_inches='tight')
+        plt.close(fig)
+        logger.info(f"Saved settlement comparison with collocation points to {path}")
+
+    def plot_settlement_collocation_scatter(self, reduced_lut):
+        """
+        Create scatter plot of collocation point coverage in settlement space.
+
+        Shows spatial position (x node) vs settlement value for all training
+        collocation points.  Helps visualize the physical constraints used when
+        training the surrogate.
+
+        Args:
+            reduced_lut: ReducedLUT object with responses and train_indices
+        """
+        plt = self._get_plt()
+
+        train_indices = reduced_lut.train_indices
+        collocation_settlements = reduced_lut.responses[train_indices]
+
+        fig, ax = plt.subplots(figsize=(12, 6))
+
+        for i, y_profile in enumerate(collocation_settlements):
+            x_nodes = np.arange(len(y_profile))
+            ax.scatter(x_nodes, y_profile, alpha=0.4, s=20,
+                       c=np.full(len(y_profile), i), cmap='viridis',
+                       vmin=0, vmax=len(collocation_settlements))
+
+        ax.set_xlabel('x node')
+        ax.set_ylabel('Settlement [m]')
+        ax.set_title(
+            f'Collocation Points in Settlement Space '
+            f'(n={len(collocation_settlements)} training points)'
+        )
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        path = os.path.join(self.plots_dir, 'settlement_comparison',
+                            'collocation_scatter.png')
+        plt.savefig(path, dpi=100, bbox_inches='tight')
+        plt.close(fig)
+        logger.info(f"Saved collocation scatter plot to {path}")
