@@ -12,6 +12,43 @@ class Visualization:
         for sub in ['material_fields', 'settlement_comparison', 'sensitivity', 'aggregate']:
             os.makedirs(os.path.join(plots_dir, sub), exist_ok=True)
 
+    def plot_surrogate_comparison(self, metrics_by_type, label='Phase-2 surrogate'):
+        """
+        Plot side-by-side R² / RMSE comparison for multiple surrogate types.
+
+        Args:
+            metrics_by_type: dict  {surrogate_type_str: metrics_dict}
+            label: figure title prefix
+        """
+        plt = self._get_plt()
+        types = list(metrics_by_type.keys())
+        r2_vals = [metrics_by_type[t].get('r2') or 0.0 for t in types]
+        rmse_vals = [metrics_by_type[t].get('rmse') or 0.0 for t in types]
+
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+        x = np.arange(len(types))
+
+        axes[0].bar(x, r2_vals, color='steelblue', edgecolor='black', alpha=0.8)
+        axes[0].set_xticks(x)
+        axes[0].set_xticklabels(types)
+        axes[0].set_ylabel('R²')
+        axes[0].set_title(f'{label} – R² comparison')
+        axes[0].set_ylim(-0.1, 1.05)
+        axes[0].grid(True, alpha=0.3, axis='y')
+
+        axes[1].bar(x, rmse_vals, color='salmon', edgecolor='black', alpha=0.8)
+        axes[1].set_xticks(x)
+        axes[1].set_xticklabels(types)
+        axes[1].set_ylabel('RMSE')
+        axes[1].set_title(f'{label} – RMSE comparison')
+        axes[1].grid(True, alpha=0.3, axis='y')
+
+        plt.tight_layout()
+        path = os.path.join(self.plots_dir, 'aggregate', 'surrogate_comparison.png')
+        plt.savefig(path, dpi=100, bbox_inches='tight')
+        plt.close(fig)
+        logger.info(f"Saved surrogate comparison plot to {path}")
+
     def _get_plt(self):
         import matplotlib
         matplotlib.use('Agg')
@@ -77,27 +114,72 @@ class Visualization:
         plt.close(fig)
         logger.info(f"Saved aggregate metrics plot to {path}")
 
-    def plot_material_fields(self, E_fields, E_reduced_values=None, n_samples=5):
-        """Compare original E fields with reduced (constant) E values."""
+    def plot_material_fields(self, E_fields, E_reduced_values=None,
+                             k_h_values=None, k_v_values=None, n_samples=5):
+        """
+        Compare original E fields with reduced (constant) E values.
+
+        Three-row layout:
+          Row 0 – Original KL-expanded E field (heatmap)
+          Row 1 – Reduced constant E' field (heatmap, same colour scale)
+          Row 2 – Difference / error map  |E_orig - E_reduced|
+
+        k_h_values / k_v_values: if provided, the reduced permeability constants
+        are annotated on the reduced-field panel.
+        """
         plt = self._get_plt()
         n = min(n_samples, len(E_fields))
-        fig, axes = plt.subplots(2, n, figsize=(4 * n, 8))
+        rng = np.random.default_rng(42)
+        sample_idx = rng.choice(len(E_fields), size=n, replace=False)
 
-        for i in range(n):
-            im = axes[0, i].imshow(E_fields[i], aspect='auto', cmap='viridis')
-            plt.colorbar(im, ax=axes[0, i])
-            axes[0, i].set_title(f'Original E field {i}')
-            axes[0, i].set_xlabel('x node')
-            axes[0, i].set_ylabel('z node')
+        n_rows = 3 if E_reduced_values is not None else 1
+        fig, axes = plt.subplots(n_rows, n, figsize=(4 * n, 4 * n_rows))
 
-            if E_reduced_values is not None:
-                E_red = np.full_like(E_fields[i], E_reduced_values[i])
-                im2 = axes[1, i].imshow(E_red, aspect='auto', cmap='viridis',
-                                        vmin=E_fields[i].min(), vmax=E_fields[i].max())
-                plt.colorbar(im2, ax=axes[1, i])
-                axes[1, i].set_title(f'Reduced E (const={E_reduced_values[i]:.2e})')
-            else:
-                axes[1, i].axis('off')
+        # Ensure axes is always 2-D
+        if n_rows == 1 and n == 1:
+            axes = np.array([[axes]])
+        elif n_rows == 1:
+            axes = axes[np.newaxis, :]
+        elif n == 1:
+            axes = axes[:, np.newaxis]
+
+        for col, i in enumerate(sample_idx):
+            E_orig = E_fields[i]
+            vmin = E_orig.min()
+            vmax = E_orig.max()
+
+            # Row 0: Original E field
+            im0 = axes[0, col].imshow(E_orig, aspect='auto', cmap='viridis',
+                                      vmin=vmin, vmax=vmax)
+            plt.colorbar(im0, ax=axes[0, col], fraction=0.046, pad=0.04)
+            axes[0, col].set_title(f'Original E field\nsample {i}')
+            axes[0, col].set_xlabel('x node')
+            axes[0, col].set_ylabel('z node')
+
+            if E_reduced_values is not None and n_rows >= 2:
+                E_val = float(E_reduced_values[i])
+                E_red = np.full_like(E_orig, E_val)
+
+                # Row 1: Reduced constant E' field
+                im1 = axes[1, col].imshow(E_red, aspect='auto', cmap='viridis',
+                                          vmin=vmin, vmax=vmax)
+                plt.colorbar(im1, ax=axes[1, col], fraction=0.046, pad=0.04)
+                subtitle = f"Reduced E'={E_val:.2e}"
+                if k_h_values is not None:
+                    subtitle += f"\nk_h={k_h_values[i]:.2e}"
+                if k_v_values is not None:
+                    subtitle += f", k_v={k_v_values[i]:.2e}"
+                axes[1, col].set_title(subtitle)
+                axes[1, col].set_xlabel('x node')
+                axes[1, col].set_ylabel('z node')
+
+                # Row 2: Difference / error map
+                diff = np.abs(E_orig - E_red)
+                im2 = axes[2, col].imshow(diff, aspect='auto', cmap='Reds')
+                plt.colorbar(im2, ax=axes[2, col], fraction=0.046, pad=0.04)
+                axes[2, col].set_title(f'|E_orig - E_reduced|\nmax={diff.max():.2e}')
+                axes[2, col].set_xlabel('x node')
+                axes[2, col].set_ylabel('z node')
 
         plt.tight_layout()
         path = os.path.join(self.plots_dir, 'material_fields', 'comparison.png')

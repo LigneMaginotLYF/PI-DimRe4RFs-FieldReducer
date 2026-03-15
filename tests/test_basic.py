@@ -141,6 +141,30 @@ class TestValidation(unittest.TestCase):
         self.assertGreater(metrics['r2'], 0.5)
         self.assertGreater(metrics['rmse'], 0)
 
+    def test_r2_not_nan_on_constant_output(self):
+        """variance_weighted R² should not produce NaN when an output column is constant."""
+        from src.validation import Validation
+        rng = np.random.default_rng(1)
+        Y = rng.standard_normal((10, 5))
+        # Make the last column constant across all samples
+        Y[:, -1] = 1.0
+        Y_pred = Y + 0.01 * rng.standard_normal((10, 5))
+        metrics = Validation.compute_metrics(Y_pred, Y)
+        # R² should be finite (not NaN) even with a zero-variance column
+        self.assertIsNotNone(metrics['r2'])
+        self.assertFalse(np.isnan(metrics['r2']))
+
+    def test_per_sample_r2_no_sklearn_regression(self):
+        """Per-sample R² should handle near-constant profiles without extreme values."""
+        from src.validation import Validation
+        rng = np.random.default_rng(2)
+        # Near-constant settlement profiles
+        Y = np.ones((10, 8)) + 0.001 * rng.standard_normal((10, 8))
+        Y_pred = Y + 0.001 * rng.standard_normal((10, 8))
+        per = Validation.compute_per_sample_metrics(Y_pred, Y)
+        # All per-sample R² should be finite
+        self.assertTrue(np.all(np.isfinite(per['r2'])))
+
 
 def _make_smoke_config():
     """Return a minimal config for fast smoke tests."""
@@ -202,7 +226,7 @@ class TestSmokeRun(unittest.TestCase):
         pipeline = TrainingPipeline(config, output_dir='results/smoke_pce')
         metrics = pipeline.orchestrate(phases=[1, 2, 3, 4])
 
-        # Core artifacts exist
+        # Core model / data artifacts exist
         self.assertTrue(os.path.exists('data/X_train.npy'))
         self.assertTrue(os.path.exists('data/Y_train.npy'))
         self.assertTrue(os.path.exists('data/lut_grid_points.npy'))
@@ -212,8 +236,23 @@ class TestSmokeRun(unittest.TestCase):
         self.assertTrue(os.path.exists('models/reduced_lut/responses.npy'))
         self.assertTrue(os.path.exists('models/reduced_lut/surrogate_pce.pkl'))
         self.assertTrue(os.path.exists('models/dimension_reducer_pce.pkl'))
+
+        # Run-level artifacts live inside the run folder
         self.assertTrue(os.path.exists('results/smoke_pce/metrics.json'))
         self.assertTrue(os.path.exists('results/smoke_pce/run_summary.txt'))
+
+        # Plots are under results/<run_id>/plots/ (not a top-level plots/ dir)
+        run_plots = 'results/smoke_pce/plots'
+        self.assertTrue(os.path.isdir(run_plots),
+                        f"Expected per-run plots dir at {run_plots}")
+        self.assertFalse(os.path.exists('plots'),
+                         "Top-level 'plots/' directory should not be created")
+
+        # Phase-2 independent evaluation artifacts
+        self.assertTrue(
+            os.path.exists('models/reduced_lut/pce/evaluation/metrics.json'),
+            "Phase-2 independent evaluation metrics should be saved",
+        )
 
         # Array shapes
         X = np.load('data/X_train.npy')
@@ -263,6 +302,50 @@ class TestSmokeRun(unittest.TestCase):
         self.assertTrue(os.path.exists('models/reduced_lut/surrogate_nn.pt'))
         self.assertTrue(os.path.exists('models/dimension_reducer_nn.pt'))
         self.assertIn('r2', metrics)
+
+        # Plots inside run folder
+        self.assertTrue(os.path.isdir('results/smoke_nn/plots'))
+        self.assertFalse(os.path.exists('plots'))
+
+    def test_dataset_reuse_flag(self):
+        """dataset.reuse=True reloads existing arrays instead of regenerating."""
+        from src.training_pipeline import TrainingPipeline
+
+        config = _make_smoke_config()
+        # First run to generate data
+        p1 = TrainingPipeline(config, output_dir='results/reuse_ds_first')
+        X1, Y1 = p1.phase1_generate_dataset()
+        mtime_before = os.path.getmtime('data/X_train.npy')
+
+        # Second run with reuse=True: should not overwrite the arrays
+        import time as _time
+        _time.sleep(0.05)  # ensure mtime would differ if file were rewritten
+        config2 = _make_smoke_config()
+        config2['dataset']['reuse'] = True
+        p2 = TrainingPipeline(config2, output_dir='results/reuse_ds_second')
+        X2, Y2 = p2.phase1_generate_dataset()
+
+        self.assertEqual(os.path.getmtime('data/X_train.npy'), mtime_before,
+                         "X_train.npy should NOT be rewritten when dataset.reuse=True")
+        self.assertTrue(np.array_equal(X1, X2))
+
+    def test_multi_surrogate_types(self):
+        """surrogate.types list trains both NN and PCE surrogates."""
+        from src.training_pipeline import TrainingPipeline
+
+        config = _make_smoke_config()
+        config['surrogate']['types'] = ['nn', 'pce']
+        config['surrogate']['epochs'] = 2
+        pipeline = TrainingPipeline(config, output_dir='results/multi_surr')
+        pipeline.orchestrate(phases=[1, 2])
+
+        # Both surrogate artefacts saved
+        self.assertTrue(os.path.exists('models/reduced_lut/surrogate_nn.pt'))
+        self.assertTrue(os.path.exists('models/reduced_lut/surrogate_pce.pkl'))
+        # Phase-2 independent evaluation saved for each type
+        self.assertTrue(os.path.exists('models/reduced_lut/nn/evaluation/metrics.json'))
+        self.assertTrue(os.path.exists('models/reduced_lut/pce/evaluation/metrics.json'))
+
 
 
 if __name__ == '__main__':
