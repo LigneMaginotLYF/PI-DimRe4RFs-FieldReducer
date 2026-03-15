@@ -22,15 +22,13 @@ class TrainingPipeline:
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
 
-        # Global artifact directories (shared across runs for reuse)
+        # Per-run plots directory lives inside the run folder.
+        self.plots_dir = os.path.join(output_dir, 'plots')
+
+        # Global artifact directories (shared across runs for reuse).
         self.data_dir = 'data'
         self.models_dir = 'models'
-        self.plots_dir = 'plots'
-        for d in [self.data_dir, self.models_dir, self.plots_dir,
-                  os.path.join(self.plots_dir, 'material_fields'),
-                  os.path.join(self.plots_dir, 'settlement_comparison'),
-                  os.path.join(self.plots_dir, 'sensitivity'),
-                  os.path.join(self.plots_dir, 'aggregate')]:
+        for d in [self.data_dir, self.models_dir]:
             os.makedirs(d, exist_ok=True)
 
         self.timings = {}
@@ -54,6 +52,9 @@ class TrainingPipeline:
         """
         Generate n_samples training samples with variable Matern KL fields.
         Returns X_train (n_samples, n_kl_terms), Y_train (n_samples, n_x).
+
+        Respects config dataset.reuse flag: when True and saved arrays exist,
+        loads them instead of recomputing.
         """
         t0 = time.time()
         logger.info("=" * 60)
@@ -72,6 +73,20 @@ class TrainingPipeline:
         k_h = mat_cfg.get('permeability_h', 1.0e-12)
         k_v = mat_cfg.get('permeability_v', 1.0e-12)
         n_x = sol_cfg.get('n_nodes_x', 20)
+
+        # Resolve save paths (allow config override)
+        x_path = ds_cfg.get('path_X', os.path.join(self.data_dir, 'X_train.npy'))
+        y_path = ds_cfg.get('path_Y', os.path.join(self.data_dir, 'Y_train.npy'))
+
+        # Reuse existing dataset if requested
+        reuse = ds_cfg.get('reuse', False)
+        if reuse and os.path.exists(x_path) and os.path.exists(y_path):
+            logger.info(f"Phase 1: reuse=True -- loading existing dataset from {x_path}")
+            X_train = np.load(x_path)
+            Y_train = np.load(y_path)
+            self.timings['phase1'] = time.time() - t0
+            logger.info(f"Phase 1 loaded in {self.timings['phase1']:.1f}s -- {X_train.shape}, {Y_train.shape}")
+            return X_train, Y_train
 
         nu_range = rf_cfg.get('nu_range', [0.5, 2.5])
         ls_range = rf_cfg.get('length_scale_range', [0.1, 0.5])
@@ -94,8 +109,9 @@ class TrainingPipeline:
             X_train[i] = xi_E
             Y_train[i] = Y
 
-        np.save(os.path.join(self.data_dir, 'X_train.npy'), X_train)
-        np.save(os.path.join(self.data_dir, 'Y_train.npy'), Y_train)
+        os.makedirs(os.path.dirname(x_path) if os.path.dirname(x_path) else '.', exist_ok=True)
+        np.save(x_path, X_train)
+        np.save(y_path, Y_train)
 
         self.timings['phase1'] = time.time() - t0
         logger.info(f"Phase 1 done in {self.timings['phase1']:.1f}s")
@@ -104,9 +120,13 @@ class TrainingPipeline:
 
     def phase2_build_reduced_surrogate(self, seed=None, force_recompute=False):
         """
-        Build LUT, fit surrogate S: xi'->Y', save for reuse.
-        If surrogate artifacts already exist and force_recompute is False, loads them.
-        Returns the fitted ReducedLUT object.
+        Build LUT, fit surrogate(s) S: xi'->Y', save for reuse.
+
+        Supports multiple surrogate types via surrogate.types (list) in config.
+        If only one type is requested, behaviour is identical to the original.
+        Respects reduced_lut.reuse config flag.
+
+        Returns the fitted ReducedLUT object (primary type loaded).
         """
         t0 = time.time()
         logger.info("=" * 60)
@@ -115,10 +135,14 @@ class TrainingPipeline:
 
         ds_cfg = self.config.get('dataset', {})
         surr_cfg = self.config.get('surrogate', {})
+        lut_cfg = self.config.get('reduced_lut', {})
         val_cfg = self.config.get('validation', {})
         seed = seed if seed is not None else ds_cfg.get('seed', 42)
 
-        surrogate_type = surr_cfg.get('type', 'nn')
+        # Support a list of types for simultaneous training
+        surrogate_types = surr_cfg.get('types', None)
+        if surrogate_types is None:
+            surrogate_types = [surr_cfg.get('type', 'nn')]
         val_fraction = val_cfg.get('val_fraction', 0.2)
 
         lut_output_dir = os.path.join(self.models_dir, 'reduced_lut')
@@ -127,36 +151,99 @@ class TrainingPipeline:
         from src.reduced_lut import ReducedLUT
         lut = ReducedLUT(self.config, solver, output_dir=lut_output_dir)
 
-        # Skip/reuse logic: load existing artifacts if present
+        # Skip/reuse logic (config reuse flag OR no force_recompute + existing cache)
+        reuse = lut_cfg.get('reuse', False)
         config_path = os.path.join(lut_output_dir, 'config.json')
-        if not force_recompute and os.path.exists(config_path):
+        if (reuse or not force_recompute) and os.path.exists(config_path):
             logger.info(f"Phase 2: Found existing surrogate at {lut_output_dir}, loading for reuse")
-            lut.load(surrogate_type=surrogate_type)
+            lut.load(surrogate_type=surrogate_types[0])
             self.timings['phase2'] = time.time() - t0
             logger.info(f"Phase 2 loaded from cache in {self.timings['phase2']:.1f}s")
             return lut
 
         lut.generate_grid(seed=seed)
         lut.precompute_responses()
-        r2_val = lut.fit_surrogate(
-            surrogate_type=surrogate_type,
-            surrogate_cfg=surr_cfg,
-            val_fraction=val_fraction,
-            seed=seed,
-        )
-        lut.save(surrogate_type=surrogate_type, r2_val=r2_val)
 
+        r2_by_type = {}
+        for s_type in surrogate_types:
+            r2_val = lut.fit_surrogate(
+                surrogate_type=s_type,
+                surrogate_cfg=surr_cfg,
+                val_fraction=val_fraction,
+                seed=seed,
+            )
+            lut.save(surrogate_type=s_type, r2_val=r2_val)
+            r2_by_type[s_type] = r2_val
+            logger.info(f"Phase 2 [{s_type}] R2={r2_val:.4f}")
+
+            # Phase-2 independent test-set evaluation
+            self._phase2_evaluate_surrogate(lut, s_type, seed=seed)
+
+        # Save LUT grid arrays to data/ for easy access
         np.save(os.path.join(self.data_dir, 'lut_grid_points.npy'), lut.grid_points)
         np.save(os.path.join(self.data_dir, 'lut_responses.npy'), lut.responses)
 
+        # Multi-surrogate comparison plot
+        if len(surrogate_types) > 1:
+            from src.visualization import Visualization
+            viz = Visualization(plots_dir=self.plots_dir)
+            metrics_by_type = {s_type: {'r2': r2, 'rmse': None}
+                               for s_type, r2 in r2_by_type.items()}
+            viz.plot_surrogate_comparison(metrics_by_type, label='Phase-2 surrogate')
+
+        # Restore the primary surrogate on the lut object
+        lut.load(surrogate_type=surrogate_types[0])
+
         self.timings['phase2'] = time.time() - t0
-        logger.info(f"Phase 2 done in {self.timings['phase2']:.1f}s, R²={r2_val:.4f}")
+        logger.info(f"Phase 2 done in {self.timings['phase2']:.1f}s -- {r2_by_type}")
         return lut
+
+    def _phase2_evaluate_surrogate(self, lut, surrogate_type, seed=None):
+        """
+        Evaluate phase-2 surrogate on an independent test split drawn from the LUT.
+        Saves metrics to models/reduced_lut/<surrogate_type>/evaluation/metrics.json
+        and a few qualitative settlement comparison plots.
+        """
+        from src.validation import Validation
+        from src.visualization import Visualization
+
+        n = len(lut.grid_points)
+        rng = np.random.default_rng(seed if seed is not None else 42)
+        idx = rng.permutation(n)
+        # Use the last 20% as an independent test set (not used in surrogate training)
+        n_test = max(1, int(n * 0.2))
+        test_idx = idx[-n_test:]
+        X_test = lut.grid_points[test_idx]
+        Y_test = lut.responses[test_idx]
+
+        Y_pred = lut.surrogate.predict(X_test)
+        metrics = Validation.compute_metrics(Y_pred, Y_test)
+
+        eval_dir = os.path.join(self.models_dir, 'reduced_lut', surrogate_type, 'evaluation')
+        os.makedirs(eval_dir, exist_ok=True)
+        with open(os.path.join(eval_dir, 'metrics.json'), 'w', encoding='utf-8') as f:
+            json.dump(metrics, f, indent=2)
+
+        # Qualitative settlement-comparison plots
+        viz = Visualization(plots_dir=eval_dir)
+        n_plot = min(5, len(Y_test))
+        viz.plot_settlement_comparison(Y_test, Y_pred, n_samples=n_plot)
+
+        r2_str = f"{metrics['r2']:.4f}" if metrics['r2'] is not None else "N/A"
+        logger.info(
+            f"Phase 2 [{surrogate_type}] independent eval: R2={r2_str}, "
+            f"RMSE={metrics['rmse']:.4e}, relL2={metrics['rel_l2']:.4f} "
+            f"(saved to {eval_dir})"
+        )
+        return metrics
 
     def phase3_train_dimension_reducer(self, X_train, Y_train, reduced_lut, seed=None):
         """
         Train dimension reducer M: xi_E(5D) -> xi'(3D) using frozen surrogate.
-        Returns trained reducer.
+
+        Supports multiple reducer types via dimension_reducer.types (list).
+        Returns (reducer_or_dict, (X_test, Y_test)).
+        When multiple types are requested, returns a dict {type: reducer}.
         """
         t0 = time.time()
         logger.info("=" * 60)
@@ -165,10 +252,16 @@ class TrainingPipeline:
 
         ds_cfg = self.config.get('dataset', {})
         surr_cfg = self.config.get('surrogate', {})
+        red_cfg = self.config.get('dimension_reducer', {})
         val_cfg = self.config.get('validation', {})
         seed = seed if seed is not None else ds_cfg.get('seed', 42)
 
-        surrogate_type = surr_cfg.get('type', 'nn')
+        # Support a list of types
+        reducer_types = red_cfg.get('types', None)
+        if reducer_types is None:
+            surrogate_type = surr_cfg.get('type', 'nn')
+            reducer_types = [surrogate_type]
+
         train_frac = val_cfg.get('train_fraction', 0.6)
         val_frac = val_cfg.get('val_fraction', 0.2)
 
@@ -196,7 +289,38 @@ class TrainingPipeline:
         input_dim = n_kl
         output_dim = 3  # xi' = [E', k'_h, k'_v]
 
-        if surrogate_type == 'nn':
+        reducers = {}
+        for r_type in reducer_types:
+            reducer = self._train_single_reducer(
+                r_type, input_dim, output_dim,
+                X_tr, Y_tr, X_val, Y_val,
+                surr_cfg, red_cfg, reduced_lut,
+            )
+            reducers[r_type] = reducer
+
+        # Save all reducer models
+        for r_type, reducer in reducers.items():
+            if r_type == 'nn':
+                import torch
+                torch.save(reducer, os.path.join(self.models_dir, 'dimension_reducer_nn.pt'))
+            else:
+                import pickle
+                with open(os.path.join(self.models_dir, f'dimension_reducer_{r_type}.pkl'), 'wb') as f:
+                    pickle.dump(reducer, f)
+
+        self.timings['phase3'] = time.time() - t0
+        logger.info(f"Phase 3 done in {self.timings['phase3']:.1f}s")
+
+        # Return single reducer for backward-compat when only one type
+        if len(reducer_types) == 1:
+            return reducers[reducer_types[0]], (X_test, Y_test)
+        return reducers, (X_test, Y_test)
+
+    def _train_single_reducer(self, r_type, input_dim, output_dim,
+                              X_tr, Y_tr, X_val, Y_val,
+                              surr_cfg, red_cfg, reduced_lut):
+        """Train a single reducer of the given type and return it."""
+        if r_type == 'nn':
             from src.mapping_learner_nn import PhysicsDrivenMappingNN
             reducer = PhysicsDrivenMappingNN(
                 input_dim=input_dim, output_dim=output_dim,
@@ -210,8 +334,6 @@ class TrainingPipeline:
                 lr=surr_cfg.get('learning_rate', 1e-3),
                 batch_size=surr_cfg.get('batch_size', 64),
             )
-            import torch
-            torch.save(reducer, os.path.join(self.models_dir, 'dimension_reducer_nn.pt'))
         else:
             from src.mapping_learner_pce import PolynomialChaosExpansion
             reducer = PolynomialChaosExpansion(
@@ -220,17 +342,15 @@ class TrainingPipeline:
                 n_outputs=output_dim,
             )
             reducer.fit_with_surrogate(X_tr, Y_tr, reduced_lut.surrogate)
-            import pickle
-            with open(os.path.join(self.models_dir, 'dimension_reducer_pce.pkl'), 'wb') as f:
-                pickle.dump(reducer, f)
-
-        self.timings['phase3'] = time.time() - t0
-        logger.info(f"Phase 3 done in {self.timings['phase3']:.1f}s")
-        return reducer, (X_test, Y_test)
+        return reducer
 
     def phase4_evaluate(self, reducer, reduced_lut, X_test, Y_test):
         """
         Evaluate dimension reducer on test set and produce visualizations.
+
+        All plots are saved under <output_dir>/plots/ (per-run directory).
+        When reducer is a dict {type: model}, evaluates all types and produces
+        a comparison plot.
         """
         t0 = time.time()
         logger.info("=" * 60)
@@ -241,31 +361,105 @@ class TrainingPipeline:
         from src.visualization import Visualization
 
         run_id = os.path.basename(self.output_dir)
+        viz = Visualization(plots_dir=self.plots_dir)
 
-        if hasattr(reducer, 'predict'):
-            xi_prime_pred = reducer.predict(X_test)
+        # Handle dict of reducers (multi-type scenario)
+        if isinstance(reducer, dict):
+            metrics_by_type = {}
+            for r_type, r_model in reducer.items():
+                m = self._evaluate_single_reducer(r_model, reduced_lut, X_test, Y_test, run_id)
+                metrics_by_type[r_type] = m
+            viz.plot_surrogate_comparison(metrics_by_type, label='Phase-3 dimension reducer')
+            # Use first as primary for detailed plots
+            primary_type = next(iter(reducer))
+            primary_reducer = reducer[primary_type]
+            metrics = metrics_by_type[primary_type]
         else:
-            xi_prime_pred = reducer(X_test)
+            primary_reducer = reducer
+            metrics = self._evaluate_single_reducer(reducer, reduced_lut, X_test, Y_test, run_id)
+
+        # Settlement comparison + aggregate metric plots
+        xi_prime_pred = primary_reducer.predict(X_test)
         Y_pred = reduced_lut.predict(xi_prime_pred)
 
-        metrics = Validation.compute_metrics(Y_pred, Y_test)
-        r2_str = f"{metrics['r2']:.4f}" if metrics['r2'] is not None else "N/A"
-        logger.info(f"Test metrics: R²={r2_str}, RMSE={metrics['rmse']:.4e}, relL2={metrics['rel_l2']:.4f}")
+        viz.plot_settlement_comparison(Y_test, Y_pred, n_samples=5)
+        viz.plot_aggregate_metrics(Y_test, Y_pred)
+        viz.plot_sobol_sensitivity(primary_reducer, input_dim=X_test.shape[1])
 
+        # Material field comparison plots
+        self._plot_material_field_comparison(
+            X_test, xi_prime_pred, viz, n_samples=min(5, len(X_test))
+        )
+
+        # Save metrics
         metrics['run_id'] = run_id
         with open(os.path.join(self.output_dir, 'metrics.json'), 'w', encoding='utf-8') as f:
             json.dump(metrics, f, indent=2)
 
-        viz = Visualization(plots_dir=self.plots_dir)
-        viz.plot_settlement_comparison(Y_test, Y_pred, n_samples=5)
-        viz.plot_aggregate_metrics(Y_test, Y_pred)
-        viz.plot_sobol_sensitivity(reducer, input_dim=X_test.shape[1])
+        r2_str = f"{metrics['r2']:.4f}" if metrics['r2'] is not None else "N/A"
+        logger.info(f"Test metrics: R2={r2_str}, RMSE={metrics['rmse']:.4e}, relL2={metrics['rel_l2']:.4f}")
 
         self.timings['phase4'] = time.time() - t0
         logger.info(f"Phase 4 done in {self.timings['phase4']:.1f}s")
         return metrics
 
-    def save_run_summary(self, metrics=None):
+    def _evaluate_single_reducer(self, reducer, reduced_lut, X_test, Y_test, run_id):
+        """Evaluate a single reducer and return metrics dict."""
+        from src.validation import Validation
+        if hasattr(reducer, 'predict'):
+            xi_prime_pred = reducer.predict(X_test)
+        else:
+            xi_prime_pred = reducer(X_test)
+        Y_pred = reduced_lut.predict(xi_prime_pred)
+        return Validation.compute_metrics(Y_pred, Y_test)
+
+    def _plot_material_field_comparison(self, X_test, xi_prime_pred, viz, n_samples=5):
+        """
+        Generate and save material field comparison plots.
+
+        Reconstructs original E fields from X_test (KL coefficients) and compares
+        them to the constant reduced E' field derived from the predicted xi'.
+        Annotates k_h and k_v values.
+        """
+        mat_cfg = self.config.get('material', {})
+        E_ref = mat_cfg.get('E_ref', 10.0e6)
+        k_ref = mat_cfg.get('permeability_ref', 1.0e-12)
+
+        field_gen = self._get_field_generator()
+        rf_cfg = self.config.get('random_field', {})
+        ds_cfg = self.config.get('dataset', {})
+        n_kl = ds_cfg.get('n_kl_terms_E', 5)
+        nu_range = rf_cfg.get('nu_range', [0.5, 2.5])
+        ls_range = rf_cfg.get('length_scale_range', [0.1, 0.5])
+
+        n = min(n_samples, len(X_test))
+        seed = self.config.get('dataset', {}).get('seed', 42)
+        rng = np.random.default_rng(seed)
+
+        E_fields = []
+        E_reduced_values = []
+        k_h_values = []
+        k_v_values = []
+
+        for i in range(n):
+            nu = rng.uniform(*nu_range)
+            length_scale = rng.uniform(*ls_range)
+            E_field = field_gen.generate_field(
+                X_test[i], nu, length_scale, n_terms=n_kl, E_ref=E_ref
+            )
+            E_fields.append(E_field)
+            xi_p = xi_prime_pred[i]
+            E_reduced_values.append(E_ref * np.exp(np.clip(float(xi_p[0]), -5, 5)))
+            k_h_values.append(k_ref * np.exp(np.clip(float(xi_p[1]), -5, 5)))
+            k_v_values.append(k_ref * np.exp(np.clip(float(xi_p[2]), -5, 5)))
+
+        viz.plot_material_fields(
+            E_fields, E_reduced_values,
+            k_h_values=k_h_values, k_v_values=k_v_values,
+            n_samples=n,
+        )
+
+    def save_run_summary(self, metrics=None, phase2_r2_by_type=None):
         """Save run summary to file."""
         summary_lines = [
             "=" * 60,
@@ -289,13 +483,26 @@ class TrainingPipeline:
             summary_lines.append(f"  {phase}: {t:.1f}s")
         total = sum(self.timings.values())
         summary_lines.append(f"  TOTAL: {total:.1f}s")
+
+        if phase2_r2_by_type:
+            summary_lines += ["", "Phase 2 surrogate R2 by type:"]
+            for s_type, r2 in phase2_r2_by_type.items():
+                summary_lines.append(f"  {s_type}: {r2:.4f}")
+
         if metrics:
             summary_lines += [
                 "",
-                "Test metrics:",
-                f"  R²: {metrics.get('r2', 'N/A')}",
+                "Test metrics (Phase 4):",
+                f"  R2: {metrics.get('r2', 'N/A')}",
                 f"  RMSE: {metrics.get('rmse', 'N/A')}",
-                f"  Relative L²: {metrics.get('rel_l2', 'N/A')}",
+                f"  Relative L2: {metrics.get('rel_l2', 'N/A')}",
+                "",
+                "R2 diagnosis:",
+                "  R2 uses variance_weighted multioutput to down-weight output nodes",
+                "  with near-zero variance across test samples, which would otherwise",
+                "  give spuriously large negative contributions to the average.",
+                "  Negative R2 indicates the reducer predictions are worse than",
+                "  predicting the mean settlement for every sample.",
             ]
         summary_lines += [
             "",
@@ -303,6 +510,7 @@ class TrainingPipeline:
             f"  Training data:    {self.data_dir}/X_train.npy, {self.data_dir}/Y_train.npy",
             f"  LUT data:         {self.data_dir}/lut_grid_points.npy, {self.data_dir}/lut_responses.npy",
             f"  Surrogate model:  {self.models_dir}/reduced_lut/",
+            f"  Phase-2 eval:     {self.models_dir}/reduced_lut/<type>/evaluation/",
             f"  Reducer model:    {self.models_dir}/dimension_reducer_{{nn.pt,pce.pkl}}",
             f"  Plots:            {self.plots_dir}/",
             f"  Metrics:          {self.output_dir}/metrics.json",
@@ -329,13 +537,26 @@ class TrainingPipeline:
             X_train = np.load(os.path.join(self.data_dir, 'X_train.npy'))
             Y_train = np.load(os.path.join(self.data_dir, 'Y_train.npy'))
 
+        phase2_r2_by_type = None
         if 2 in phases:
             reduced_lut = self.phase2_build_reduced_surrogate()
+            # Collect R² values stored in config.json for the summary
+            import json as _json
+            cfg_path = os.path.join(self.models_dir, 'reduced_lut', 'config.json')
+            if os.path.exists(cfg_path):
+                with open(cfg_path, 'r', encoding='utf-8') as _f:
+                    _meta = _json.load(_f)
+                phase2_r2_by_type = {_meta.get('surrogate_type', 'unknown'):
+                                     _meta.get('r2_validation')}
         elif any(p in phases for p in [3, 4]):
             from src.reduced_lut import ReducedLUT
             solver = self._get_solver()
             lut_dir = os.path.join(self.models_dir, 'reduced_lut')
-            surr_type = self.config.get('surrogate', {}).get('type', 'nn')
+            surr_cfg = self.config.get('surrogate', {})
+            surr_types = surr_cfg.get('types', None)
+            if surr_types is None:
+                surr_types = [surr_cfg.get('type', 'nn')]
+            surr_type = surr_types[0]
             reduced_lut = ReducedLUT(self.config, solver, output_dir=lut_dir)
             reduced_lut.load(surrogate_type=surr_type)
 
@@ -347,19 +568,32 @@ class TrainingPipeline:
             X_test = np.load(os.path.join(self.data_dir, 'X_test.npy'))
             Y_test = np.load(os.path.join(self.data_dir, 'Y_test.npy'))
             # Load saved reducer model
-            surr_type = self.config.get('surrogate', {}).get('type', 'nn')
-            if surr_type == 'nn':
-                import torch
-                reducer_path = os.path.join(self.models_dir, 'dimension_reducer_nn.pt')
-                reducer = torch.load(reducer_path, weights_only=False)
+            surr_cfg = self.config.get('surrogate', {})
+            red_cfg = self.config.get('dimension_reducer', {})
+            reducer_types = red_cfg.get('types', None)
+            if reducer_types is None:
+                surrogate_type = surr_cfg.get('type', 'nn')
+                reducer_types = [surrogate_type]
+
+            if len(reducer_types) == 1:
+                reducer = self._load_reducer(reducer_types[0])
             else:
-                import pickle
-                reducer_path = os.path.join(self.models_dir, 'dimension_reducer_pce.pkl')
-                with open(reducer_path, 'rb') as f:
-                    reducer = pickle.load(f)
+                reducer = {rt: self._load_reducer(rt) for rt in reducer_types}
 
         if 4 in phases:
             metrics = self.phase4_evaluate(reducer, reduced_lut, X_test, Y_test)
 
-        self.save_run_summary(metrics)
+        self.save_run_summary(metrics, phase2_r2_by_type=phase2_r2_by_type)
         return metrics
+
+    def _load_reducer(self, reducer_type):
+        """Load a saved reducer of the given type."""
+        if reducer_type == 'nn':
+            import torch
+            reducer_path = os.path.join(self.models_dir, 'dimension_reducer_nn.pt')
+            return torch.load(reducer_path, weights_only=False)
+        else:
+            import pickle
+            reducer_path = os.path.join(self.models_dir, f'dimension_reducer_{reducer_type}.pkl')
+            with open(reducer_path, 'rb') as f:
+                return pickle.load(f)

@@ -2,6 +2,11 @@ dataset:
   n_samples: 500
   n_kl_terms_E: 5
   seed: 42
+  # Reuse an existing dataset instead of regenerating it.
+  # Set to true and optionally override path_X / path_Y.
+  reuse: false
+  # path_X: data/X_train.npy
+  # path_Y: data/Y_train.npy
 
 material:
   E_ref: 10.0e6
@@ -37,10 +42,16 @@ dimension_reducer:
   d: 1
   basis_type: "polynomial"
   basis_order: 1
+  # Train multiple reducer types simultaneously, e.g. ["nn", "pce"].
+  # If omitted, defaults to the surrogate.type above.
+  # types: ["nn", "pce"]
 
 reduced_lut:
   n_grid_points: 2000
   grid_type: "random"
+  # Reuse an existing LUT surrogate instead of recomputing it.
+  reuse: false
+  # path: models/reduced_lut  # custom directory for the LUT artifacts
 
 surrogate:
   type: "nn"
@@ -49,6 +60,9 @@ surrogate:
   epochs: 200
   learning_rate: 1.0e-3
   batch_size: 64
+  # Train multiple surrogate types simultaneously, e.g. ["nn", "pce"].
+  # If omitted, defaults to type above.
+  # types: ["nn", "pce"]
 
 validation:
   train_fraction: 0.6
