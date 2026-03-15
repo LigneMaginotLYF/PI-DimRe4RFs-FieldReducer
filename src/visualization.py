@@ -157,14 +157,21 @@ class Visualization:
             axes[0, col].set_ylabel('z node')
 
             if E_reduced_values is not None and n_rows >= 2:
-                E_val = float(E_reduced_values[i])
-                E_red = np.full_like(E_orig, E_val)
+                E_val_input = E_reduced_values[i]
+                if isinstance(E_val_input, np.ndarray):
+                    E_red = E_val_input  # pre-reconstructed 2D field
+                else:
+                    E_red = np.full_like(E_orig, float(E_val_input))
 
                 # Row 1: Reduced constant E' field
                 im1 = axes[1, col].imshow(E_red, aspect='auto', cmap='viridis',
                                           vmin=vmin, vmax=vmax)
                 plt.colorbar(im1, ax=axes[1, col], fraction=0.046, pad=0.04)
-                subtitle = f"Reduced E'={E_val:.2e}"
+                if isinstance(E_val_input, np.ndarray):
+                    E_mean = float(np.mean(E_val_input))
+                    subtitle = f"Reduced E' (mean={E_mean:.2e})"
+                else:
+                    subtitle = f"Reduced E'={float(E_val_input):.2e}"
                 if k_h_values is not None:
                     subtitle += f"\nk_h={k_h_values[i]:.2e}"
                 if k_v_values is not None:

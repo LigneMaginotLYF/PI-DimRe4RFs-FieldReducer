@@ -147,14 +147,36 @@ class TrainingPipeline:
 
         lut_output_dir = os.path.join(self.models_dir, 'reduced_lut')
         solver = self._get_solver()
+        reuse = lut_cfg.get('reuse', False)
 
         from src.reduced_lut import ReducedLUT
         lut = ReducedLUT(self.config, solver, output_dir=lut_output_dir)
 
-        # Skip/reuse logic (config reuse flag OR no force_recompute + existing cache)
-        reuse = lut_cfg.get('reuse', False)
+        # Compute config hash to detect dimension/basis changes
+        config_hash = lut.config_hash
+
+        # Check if we can reuse: config.json must exist, hash must match,
+        # and ALL requested surrogate types must have saved artifacts.
+        def _surrogate_artifact_exists(s_type):
+            if s_type == 'nn':
+                return (
+                    os.path.exists(os.path.join(lut_output_dir, 'surrogate_nn_full.pt'))
+                    or os.path.exists(os.path.join(lut_output_dir, 'surrogate_nn.pt'))
+                )
+            return os.path.exists(os.path.join(lut_output_dir, f'surrogate_{s_type}.pkl'))
+
         config_path = os.path.join(lut_output_dir, 'config.json')
-        if (reuse or not force_recompute) and os.path.exists(config_path):
+        cached_hash_matches = False
+        if os.path.exists(config_path):
+            with open(config_path, 'r', encoding='utf-8') as _f:
+                _meta = json.load(_f)
+            cached_hash_matches = (_meta.get('config_hash') == config_hash)
+
+        all_types_cached = cached_hash_matches and all(
+            _surrogate_artifact_exists(t) for t in surrogate_types
+        )
+
+        if (reuse or not force_recompute) and all_types_cached:
             logger.info(f"Phase 2: Found existing surrogate at {lut_output_dir}, loading for reuse")
             lut.load(surrogate_type=surrogate_types[0])
             self.timings['phase2'] = time.time() - t0
@@ -287,7 +309,7 @@ class TrainingPipeline:
 
         n_kl = X_train.shape[1]
         input_dim = n_kl
-        output_dim = 3  # xi' = [E', k'_h, k'_v]
+        output_dim = red_cfg.get('d', 1)  # output dimension matches reduced space
 
         reducers = {}
         for r_type in reducer_types:
@@ -388,7 +410,7 @@ class TrainingPipeline:
 
         # Material field comparison plots
         self._plot_material_field_comparison(
-            X_test, xi_prime_pred, viz, n_samples=min(5, len(X_test))
+            X_test, xi_prime_pred, viz, reduced_lut, n_samples=min(5, len(X_test))
         )
 
         # Save metrics
@@ -413,17 +435,18 @@ class TrainingPipeline:
         Y_pred = reduced_lut.predict(xi_prime_pred)
         return Validation.compute_metrics(Y_pred, Y_test)
 
-    def _plot_material_field_comparison(self, X_test, xi_prime_pred, viz, n_samples=5):
+    def _plot_material_field_comparison(self, X_test, xi_prime_pred, viz, reduced_lut, n_samples=5):
         """
         Generate and save material field comparison plots.
 
         Reconstructs original E fields from X_test (KL coefficients) and compares
-        them to the constant reduced E' field derived from the predicted xi'.
-        Annotates k_h and k_v values.
+        them to the reduced E' field derived from the predicted xi' via basis reconstruction.
+        k_h and k_v are taken from config (fixed material permeabilities).
         """
         mat_cfg = self.config.get('material', {})
         E_ref = mat_cfg.get('E_ref', 10.0e6)
-        k_ref = mat_cfg.get('permeability_ref', 1.0e-12)
+        k_h = mat_cfg.get('permeability_h', 1.0e-12)
+        k_v = mat_cfg.get('permeability_v', 1.0e-12)
 
         field_gen = self._get_field_generator()
         rf_cfg = self.config.get('random_field', {})
@@ -437,7 +460,7 @@ class TrainingPipeline:
         rng = np.random.default_rng(seed)
 
         E_fields = []
-        E_reduced_values = []
+        E_reduced_fields = []
         k_h_values = []
         k_v_values = []
 
@@ -448,13 +471,14 @@ class TrainingPipeline:
                 X_test[i], nu, length_scale, n_terms=n_kl, E_ref=E_ref
             )
             E_fields.append(E_field)
-            xi_p = xi_prime_pred[i]
-            E_reduced_values.append(E_ref * np.exp(np.clip(float(xi_p[0]), -5, 5)))
-            k_h_values.append(k_ref * np.exp(np.clip(float(xi_p[1]), -5, 5)))
-            k_v_values.append(k_ref * np.exp(np.clip(float(xi_p[2]), -5, 5)))
+            # Reconstruct reduced E field using basis functions (d-dimensional xi')
+            E_red_field = reduced_lut._reconstruct_field(xi_prime_pred[i])
+            E_reduced_fields.append(E_red_field)
+            k_h_values.append(k_h)
+            k_v_values.append(k_v)
 
         viz.plot_material_fields(
-            E_fields, E_reduced_values,
+            E_fields, E_reduced_fields,
             k_h_values=k_h_values, k_v_values=k_v_values,
             n_samples=n,
         )
