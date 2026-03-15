@@ -350,6 +350,81 @@ class TestSmokeRun(unittest.TestCase):
         self.assertTrue(os.path.exists('models/reduced_lut/nn/evaluation/metrics.json'))
         self.assertTrue(os.path.exists('models/reduced_lut/pce/evaluation/metrics.json'))
 
+    def test_collocation_indices_saved_and_loaded(self):
+        """fit_surrogate saves train/val indices; save()/load() persist them."""
+        from src.training_pipeline import TrainingPipeline
+
+        config = _make_smoke_config()
+        pipeline = TrainingPipeline(config, output_dir='results/colloc_idx')
+        pipeline.orchestrate(phases=[1, 2])
+
+        # Collocation index files must exist after Phase 2
+        self.assertTrue(
+            os.path.exists('models/reduced_lut/train_indices.npy'),
+            "train_indices.npy should be saved after Phase 2",
+        )
+        self.assertTrue(
+            os.path.exists('models/reduced_lut/val_indices.npy'),
+            "val_indices.npy should be saved after Phase 2",
+        )
+
+        # Loading the LUT should restore the indices
+        from src.reduced_lut import ReducedLUT
+        from src.forward_solver_2d import BiotSolver2D
+        solver = BiotSolver2D(config)
+        lut = ReducedLUT(config, solver, output_dir='models/reduced_lut')
+        lut.load(surrogate_type='pce')
+
+        self.assertIsNotNone(lut.train_indices)
+        self.assertIsNotNone(lut.val_indices)
+        n = len(lut.grid_points)
+        n_val = len(lut.val_indices)
+        n_train = len(lut.train_indices)
+        self.assertEqual(n_train + n_val, n)
+
+    def test_multi_surrogate_phase3_no_none_error(self):
+        """Phase 3 with multiple reducer types loads the correct surrogate for each."""
+        from src.training_pipeline import TrainingPipeline
+
+        config = _make_smoke_config()
+        config['surrogate']['types'] = ['nn', 'pce']
+        config['surrogate']['epochs'] = 2
+        config['dimension_reducer']['types'] = ['nn', 'pce']
+        pipeline = TrainingPipeline(config, output_dir='results/multi_reducer')
+        # Should complete phases 1-3 without NoneType errors
+        pipeline.orchestrate(phases=[1, 2, 3])
+
+        self.assertTrue(os.path.exists('models/dimension_reducer_nn.pt'))
+        self.assertTrue(os.path.exists('models/dimension_reducer_pce.pkl'))
+
+    def test_collocation_visualization(self):
+        """plot_settlement_comparison_with_collocation and plot_settlement_collocation_scatter
+        produce output files when called with a LUT that has train_indices."""
+        from src.training_pipeline import TrainingPipeline
+
+        config = _make_smoke_config()
+        pipeline = TrainingPipeline(config, output_dir='results/colloc_viz')
+        X_train, Y_train = pipeline.phase1_generate_dataset()
+        lut = pipeline.phase2_build_reduced_surrogate()
+        reducer, (X_test, Y_test) = pipeline.phase3_train_dimension_reducer(
+            X_train, Y_train, lut
+        )
+
+        from src.visualization import Visualization
+        viz = Visualization(plots_dir='results/colloc_viz/plots')
+
+        xi_prime = reducer.predict(X_test)
+        Y_pred = lut.predict(xi_prime)
+
+        viz.plot_settlement_comparison_with_collocation(Y_test, Y_pred, lut, n_samples=2)
+        viz.plot_settlement_collocation_scatter(lut)
+
+        self.assertTrue(os.path.exists(
+            'results/colloc_viz/plots/settlement_comparison/comparison_with_collocation.png'
+        ))
+        self.assertTrue(os.path.exists(
+            'results/colloc_viz/plots/settlement_comparison/collocation_scatter.png'
+        ))
 
 
 if __name__ == '__main__':

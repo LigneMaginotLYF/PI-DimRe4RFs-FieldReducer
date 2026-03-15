@@ -17,6 +17,9 @@ class ReducedLUT:
     field reconstruction, fits surrogate, saves/loads for reuse.
     """
 
+    _TRAIN_INDICES_FILE = 'train_indices.npy'
+    _VAL_INDICES_FILE = 'val_indices.npy'
+
     def __init__(self, config, solver, output_dir=None):
         self.config = config
         self.solver = solver
@@ -47,6 +50,8 @@ class ReducedLUT:
         self.grid_points = None
         self.responses = None
         self.surrogate = None
+        self.train_indices = None
+        self.val_indices = None
 
     def _compute_config_hash(self):
         """Compute a short hash of (d, basis_type, basis_order) to detect config changes.
@@ -196,6 +201,9 @@ class ReducedLUT:
         val_idx = idx[:n_val]
         train_idx = idx[n_val:]
 
+        self.train_indices = train_idx
+        self.val_indices = val_idx
+
         X_train = self.grid_points[train_idx]
         Y_train = self.responses[train_idx]
         X_val = self.grid_points[val_idx]
@@ -236,6 +244,11 @@ class ReducedLUT:
         """Save LUT data, surrogate, and config to output_dir."""
         np.save(os.path.join(self.output_dir, 'grid_points.npy'), self.grid_points)
         np.save(os.path.join(self.output_dir, 'responses.npy'), self.responses)
+
+        if self.train_indices is not None:
+            np.save(os.path.join(self.output_dir, self._TRAIN_INDICES_FILE), self.train_indices)
+        if self.val_indices is not None:
+            np.save(os.path.join(self.output_dir, self._VAL_INDICES_FILE), self.val_indices)
 
         if surrogate_type == 'nn' and hasattr(self.surrogate, 'state_dict'):
             torch.save(self.surrogate.state_dict(),
@@ -303,6 +316,14 @@ class ReducedLUT:
                 self.surrogate = pickle.load(f)
 
         logger.info(f"Loaded LUT surrogate from {self.output_dir}")
+
+        train_idx_path = os.path.join(self.output_dir, self._TRAIN_INDICES_FILE)
+        if os.path.exists(train_idx_path):
+            self.train_indices = np.load(train_idx_path)
+        val_idx_path = os.path.join(self.output_dir, self._VAL_INDICES_FILE)
+        if os.path.exists(val_idx_path):
+            self.val_indices = np.load(val_idx_path)
+
         return self
 
     def predict(self, xi_prime):
