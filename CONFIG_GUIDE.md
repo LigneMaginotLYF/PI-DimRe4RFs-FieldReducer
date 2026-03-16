@@ -161,13 +161,35 @@ Settings for the Phase-2 surrogate S: ξ' → Y and the Phase-3 reducer backbone
 
 ## `collocation`
 
-Optional settings for collocation positions used in Phase-3 physics-driven training
-and settlement-comparison plots.
+Single-knob configuration for collocation points.  The same positions are
+used in **both** Phase-3 training loss evaluation and Phase-4/visualization
+plot markers.  This ensures a single source of truth across the pipeline.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `n_points` | int | *(all LUT points)* | Number of collocation points used in Phase-3. Defaults to `reduced_lut.n_grid_points`. |
-| `positions` | list[float] | *(all x-nodes)* | Explicit physical x-positions (in metres) for collocation markers on settlement comparison plots. Defaults to all `n_nodes_x` positions. |
+| `positions` | list[float] | *(all x-nodes)* | Physical x-coordinates (metres) of the collocation points.  Each value is mapped to the nearest node index in the solver's x-grid.  If omitted (or the section is `null`/empty), all `n_nodes_x` nodes are used. |
+
+### How it works
+
+1. `positions` is converted to node indices against `np.linspace(0, length_x, n_nodes_x)`.
+2. The resulting **collocation indices** are saved to `models/reduced_lut/collocation_indices.npy` at the end of Phase 3.
+3. **Phase-3 training** (NN and PCE reducers) computes the MSE loss only at these indices: `loss = MSE(Y_pred[:, colloc_idx], Y_true[:, colloc_idx])`.
+4. **Phase-4 plots** load `collocation_indices.npy` and mark those x-positions as green circles on the settlement-comparison curves.
+
+> **Note**: `collocation.positions` controls the _subset of x-nodes_ involved in
+> training and plotting.  The full settlement curve is always plotted on a
+> complete `n_nodes_x`-point x-axis; collocation positions are markers only.
+
+### Example
+
+```yaml
+collocation:
+  positions: [0.0, 0.25, 0.5, 0.75, 1.0]
+```
+
+With `n_nodes_x: 20` and `length_x: 1.0` this selects nodes 0, 5, 10, 14, 19
+(nearest grid points), resulting in 5-point Phase-3 loss and 5 green circles
+in the settlement comparison plots.
 
 ---
 
@@ -249,11 +271,15 @@ For exact machine-precision equivalence both `nu_sampling` and `length_scale_sam
 
 The `plots/settlement_comparison/comparison_with_collocation.png` plot shows:
 
-1. **Blue solid line** — Ground-truth (GT) settlement profile.
-2. **Red dashed line** — Reduced-space prediction profile.
-3. **Green open circles** — GT values at collocation x-positions (marks WHERE the collocation constraints are applied, **not** independent LUT settlement profiles).
+1. **Blue solid line** — Ground-truth (GT) settlement profile (full `n_nodes_x`-point curve).
+2. **Red dashed line** — Reduced-space prediction profile (full `n_nodes_x`-point curve).
+3. **Green open circles** — GT values at **collocation node indices** (the same indices used for Phase-3 training loss).
 
-The x-axis represents physical x-positions (0 … L_x), not node indices.
+The x-axis always represents the full physical x-grid (0 … L_x, `n_nodes_x` points), regardless of `collocation.positions`.  Collocation positions are shown as markers, never as the x-axis itself.
+
+> **Single source of truth**: collocation indices are computed once (in Phase 3),
+> saved to `models/reduced_lut/collocation_indices.npy`, and reloaded by Phase 4
+> for plotting.  Training loss and plot markers always use identical index sets.
 
 ---
 
@@ -286,6 +312,7 @@ models/
 │   ├── grid_points.npy
 │   ├── responses.npy
 │   ├── surrogate_nn.pt / surrogate_pce.pkl
+│   ├── collocation_indices.npy # Node indices used for Phase-3 loss & plot markers
 │   ├── nn/evaluation/
 │   │   ├── metrics.json
 │   │   └── settlement_comparison/comparison.png

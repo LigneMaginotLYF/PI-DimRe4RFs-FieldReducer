@@ -276,7 +276,8 @@ class Visualization:
 
     def plot_settlement_comparison_with_collocation(self, Y_original, Y_predicted,
                                                      reduced_lut, n_samples=5,
-                                                     x_positions=None):
+                                                     x_positions=None,
+                                                     colloc_idx=None):
         """
         Plot GT vs reduced-space settlement profiles with collocation positions marked.
 
@@ -284,25 +285,32 @@ class Visualization:
           - Blue solid line       : GT settlement profile
           - Red dashed line       : Reduced-space prediction
           - Green circle markers  : GT values at collocation x-positions
-            (marks WHERE the collocation constraints are applied – NOT independent
-            scatter clouds from random LUT training settlements)
-
-        The collocation x-positions are the physical positions of the output nodes
-        used in Phase-2 training.  By default all n_x output nodes are used;
-        if a subset is desired, pass ``x_positions`` as a subset of node coordinates.
+            (marks WHERE Phase-3 collocation constraints are applied)
 
         Args:
             Y_original    : shape (n_test, n_x)
             Y_predicted   : shape (n_test, n_x)
             reduced_lut   : ReducedLUT with train_indices and responses attributes
             n_samples     : Number of random test samples to plot
-            x_positions   : Physical x-coordinates of the n_x output nodes,
+            x_positions   : Physical x-coordinates of ALL n_x output nodes,
                             shape (n_x,).  Defaults to 0, 1, ..., n_x-1.
+                            Must match the full n_x width of Y_original.
+            colloc_idx    : 1-D integer array of node indices used as collocation
+                            points in Phase-3 training.  Green circles are drawn
+                            only at these positions.  If None, circles are drawn
+                            at every node (all nodes are collocation points).
         """
         plt = self._get_plt()
         n_x = Y_original.shape[1]
         if x_positions is None:
             x_positions = np.arange(n_x)
+
+        # Collocation x-positions for markers
+        if colloc_idx is not None:
+            colloc_x = x_positions[colloc_idx]
+        else:
+            colloc_x = x_positions
+            colloc_idx = np.arange(n_x)
 
         n = min(n_samples, len(Y_original))
         rng = np.random.default_rng(42)
@@ -313,14 +321,14 @@ class Visualization:
             axes = [axes]
 
         for ax, idx in zip(axes, indices):
-            # GT curve
+            # GT curve (full profile)
             ax.plot(x_positions, Y_original[idx], 'b-',
                     label='GT', linewidth=2.5, zorder=3)
-            # Reduced-space prediction curve
+            # Reduced-space prediction curve (full profile)
             ax.plot(x_positions, Y_predicted[idx], 'r--',
                     label='Reduced-space prediction', linewidth=2.5, zorder=3)
-            # Collocation x-positions marked as circles ON the GT curve
-            ax.plot(x_positions, Y_original[idx], 'go',
+            # Collocation positions marked as circles ON the GT curve
+            ax.plot(colloc_x, Y_original[idx][colloc_idx], 'go',
                     markersize=6, markerfacecolor='none', markeredgewidth=1.5,
                     label='Collocation positions', zorder=4)
 

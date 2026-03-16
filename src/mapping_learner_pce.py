@@ -73,16 +73,19 @@ class PolynomialChaosExpansion:
         logger.info(f"PCE fit: {X_train.shape[0]} samples, condition number ~{np.linalg.cond(Phi):.2e}")
         return self
 
-    def fit_with_surrogate(self, X_train, Y_train, surrogate):
+    def fit_with_surrogate(self, X_train, Y_train, surrogate, colloc_idx=None):
         """
         Fit PCE as dimension reducer M: xi_E -> xi' using surrogate-based loss.
         Uses a two-step approach: first fit PCE to map xi_E -> xi' by minimizing
-        ||S(M(xi_E)) - Y_train||, approximated by projecting onto surrogate predictions.
+        ||S(M(xi_E))[:, colloc_idx] - Y_train[:, colloc_idx]||, approximated by
+        projecting onto surrogate predictions.
 
         Args:
             X_train: shape (n_samples, n_inputs) - KL coefficients xi_E
             Y_train: shape (n_samples, n_x) - reference settlement profiles
             surrogate: fitted surrogate S: xi'(3D) -> Y(n_x)
+            colloc_idx: 1-D integer array of output node indices to include in
+                the loss.  If None, all output nodes are used (full-profile MSE).
         """
         # We use a simple approach: optimize xi' for each sample to match Y_train,
         # then fit PCE to the (X_train, xi'_opt) pairs.
@@ -96,6 +99,8 @@ class PolynomialChaosExpansion:
 
             def obj(xi_p):
                 y_pred = surrogate.predict(xi_p.reshape(1, -1))[0]
+                if colloc_idx is not None:
+                    return np.sum((y_pred[colloc_idx] - y_ref[colloc_idx]) ** 2)
                 return np.sum((y_pred - y_ref) ** 2)
 
             def grad(xi_p):
