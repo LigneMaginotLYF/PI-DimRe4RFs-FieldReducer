@@ -115,6 +115,53 @@ class TrainingPipeline:
             return ds_cfg['n_kl_terms_E']
         return 5  # default
 
+    @staticmethod
+    def _compute_collocation_indices(config, n_nodes_x, length_x):
+        """
+        Compute collocation node indices from config.
+
+        Uses ``collocation.positions`` (physical x-coordinates) when provided;
+        otherwise defaults to all n_nodes_x nodes.
+
+        The same indices are used for:
+          - Phase-3 training loss (compare Y at colloc_idx only)
+          - Phase-4 plot markers (green circles on settlement curves)
+
+        Args:
+            config      : Full pipeline config dict.
+            n_nodes_x   : Number of x-nodes in the solver grid.
+            length_x    : Physical length of the domain in x.
+
+        Returns:
+            colloc_idx  : 1-D numpy int array of node indices, sorted ascending.
+        """
+        collocation_cfg = config.get('collocation') or {}
+        positions_cfg = collocation_cfg.get('positions', None)
+        if positions_cfg is not None:
+            positions = np.asarray(positions_cfg, dtype=float)
+            # Map each physical position to the nearest node index.
+            # The grid is uniform so searchsorted gives an O(log n) candidate,
+            # but we still clamp and compare both neighbours for correctness.
+            x_grid = np.linspace(0.0, length_x, n_nodes_x)
+            dx = length_x / max(n_nodes_x - 1, 1)
+            raw = np.searchsorted(x_grid, positions)
+            raw = np.clip(raw, 0, n_nodes_x - 1)
+            # Prefer left neighbour when equidistant or closer
+            left = np.clip(raw - 1, 0, n_nodes_x - 1)
+            use_left = np.abs(x_grid[left] - positions) <= np.abs(x_grid[raw] - positions)
+            indices = np.where(use_left, left, raw).astype(int)
+            colloc_idx = np.unique(indices)  # sorted, deduplicated
+            logger.info(
+                f"Collocation: using {len(colloc_idx)} node indices "
+                f"from {len(positions)} configured positions: {colloc_idx.tolist()}"
+            )
+        else:
+            colloc_idx = np.arange(n_nodes_x, dtype=int)
+            logger.info(
+                f"Collocation: no positions configured – using all {n_nodes_x} nodes"
+            )
+        return colloc_idx
+
 
     def phase1_generate_dataset(self, n_samples=None, seed=None):
         """
@@ -334,6 +381,10 @@ class TrainingPipeline:
         Supports multiple reducer types via dimension_reducer.types (list).
         Returns (reducer_or_dict, (X_test, Y_test)).
         When multiple types are requested, returns a dict {type: reducer}.
+
+        Collocation indices are computed from ``collocation.positions`` (if set)
+        and saved to ``models/reduced_lut/collocation_indices.npy`` so that
+        Phase-4 plotting can use the same subset.
         """
         t0 = time.time()
         logger.info("=" * 60)
@@ -344,7 +395,21 @@ class TrainingPipeline:
         surr_cfg = self.config.get('surrogate', {})
         red_cfg = self.config.get('dimension_reducer', {})
         val_cfg = self.config.get('validation', {})
+        sol_cfg = self.config.get('solver', {})
+        dom_cfg = self.config.get('domain', {})
         seed = seed if seed is not None else ds_cfg.get('seed', 42)
+
+        # Compute collocation indices – single source of truth for Phase-3 + Phase-4
+        n_nodes_x = sol_cfg.get('n_nodes_x', 20)
+        length_x = dom_cfg.get('length_x', 1.0)
+        colloc_idx = self._compute_collocation_indices(self.config, n_nodes_x, length_x)
+        lut_output_dir = os.path.join(self.models_dir, 'reduced_lut')
+        os.makedirs(lut_output_dir, exist_ok=True)
+        np.save(os.path.join(lut_output_dir, 'collocation_indices.npy'), colloc_idx)
+        logger.info(
+            f"Phase 3: saved collocation_indices.npy "
+            f"({len(colloc_idx)} indices) to {lut_output_dir}"
+        )
 
         # Support a list of types
         reducer_types = red_cfg.get('types', None)
@@ -395,7 +460,6 @@ class TrainingPipeline:
             return reducer, (X_test, Y_test)
 
         reducers = {}
-        lut_output_dir = os.path.join(self.models_dir, 'reduced_lut')
         for r_type in reducer_types:
             # Load the correct surrogate for this reducer type into a dedicated LUT instance
             from src.reduced_lut import ReducedLUT
@@ -406,6 +470,7 @@ class TrainingPipeline:
                 r_type, input_dim, output_dim,
                 X_tr, Y_tr, X_val, Y_val,
                 surr_cfg, red_cfg, lut_for_type,
+                colloc_idx=colloc_idx,
             )
             reducers[r_type] = reducer
 
@@ -429,7 +494,8 @@ class TrainingPipeline:
 
     def _train_single_reducer(self, r_type, input_dim, output_dim,
                               X_tr, Y_tr, X_val, Y_val,
-                              surr_cfg, red_cfg, reduced_lut):
+                              surr_cfg, red_cfg, reduced_lut,
+                              colloc_idx=None):
         """Train a single reducer of the given type and return it."""
         if r_type == 'nn':
             from src.mapping_learner_nn import PhysicsDrivenMappingNN
@@ -444,6 +510,7 @@ class TrainingPipeline:
                 epochs=surr_cfg.get('epochs', 200),
                 lr=surr_cfg.get('learning_rate', 1e-3),
                 batch_size=surr_cfg.get('batch_size', 64),
+                colloc_idx=colloc_idx,
             )
         else:
             from src.mapping_learner_pce import PolynomialChaosExpansion
@@ -454,7 +521,8 @@ class TrainingPipeline:
                 n_inputs=input_dim,
                 n_outputs=output_dim,
             )
-            reducer.fit_with_surrogate(X_tr, Y_tr, reduced_lut.surrogate)
+            reducer.fit_with_surrogate(X_tr, Y_tr, reduced_lut.surrogate,
+                                       colloc_idx=colloc_idx)
         return reducer
 
     def phase4_evaluate(self, reducer, reduced_lut, X_test, Y_test):
@@ -504,15 +572,24 @@ class TrainingPipeline:
         # Physical x-positions for settlement comparison plots
         dom_cfg = self.config.get('domain', {})
         sol_cfg = self.config.get('solver', {})
-        collocation_cfg = self.config.get('collocation', {})
         n_x = sol_cfg.get('n_nodes_x', 20)
         length_x = dom_cfg.get('length_x', 1.0)
-        # Allow explicit positions via config; default = uniform spacing
-        x_positions_cfg = collocation_cfg.get('positions', None)
-        if x_positions_cfg is not None:
-            x_positions = np.asarray(x_positions_cfg, dtype=float)
+        # Always use the full x-grid for the curve; collocation positions are
+        # markers only (green circles) and never replace the full x-axis.
+        x_positions = np.linspace(0.0, length_x, n_x)
+
+        # Load collocation indices saved during Phase 3 (single source of truth).
+        # Fall back to _compute_collocation_indices if artifact is absent (e.g.
+        # when Phase 4 is called standalone without a prior Phase 3 run).
+        colloc_idx_path = os.path.join(
+            self.models_dir, 'reduced_lut', 'collocation_indices.npy'
+        )
+        if os.path.exists(colloc_idx_path):
+            colloc_idx = np.load(colloc_idx_path)
         else:
-            x_positions = np.linspace(0.0, length_x, n_x)
+            colloc_idx = self._compute_collocation_indices(
+                self.config, n_x, length_x
+            )
 
         viz.plot_settlement_comparison(Y_test, Y_pred, n_samples=5,
                                        x_positions=x_positions)
@@ -523,7 +600,8 @@ class TrainingPipeline:
         if reduced_lut.train_indices is not None:
             viz.plot_settlement_comparison_with_collocation(
                 Y_test, Y_pred, reduced_lut, n_samples=5,
-                x_positions=x_positions
+                x_positions=x_positions,
+                colloc_idx=colloc_idx,
             )
 
         # Material field comparison plots

@@ -1110,5 +1110,139 @@ class TestConfigValidationDCT(unittest.TestCase):
             cm.validate(cfg)
 
 
+class TestCollocationConsistency(unittest.TestCase):
+    """Tests verifying collocation single-source-of-truth behaviour."""
+
+    def test_5_positions_n_nodes_x_20_no_crash(self):
+        """5 collocation positions with n_nodes_x=20 must not cause a shape mismatch
+        crash when plotting settlement curves."""
+        import tempfile, shutil
+        from src.training_pipeline import TrainingPipeline
+        from src.visualization import Visualization
+
+        cfg = _make_smoke_config()
+        cfg['solver']['n_nodes_x'] = 20
+        # 5 collocation positions – intentionally fewer than n_nodes_x=20
+        cfg['collocation'] = {'positions': [0.0, 0.25, 0.5, 0.75, 1.0]}
+
+        tmp = tempfile.mkdtemp(prefix='pi_colloc_5pos_')
+        orig = os.getcwd()
+        try:
+            os.chdir(tmp)
+            pipeline = TrainingPipeline(cfg, output_dir='results/colloc_5pos')
+            X, Y = pipeline.phase1_generate_dataset()
+            lut = pipeline.phase2_build_reduced_surrogate()
+            reducer, (X_test, Y_test) = pipeline.phase3_train_dimension_reducer(
+                X, Y, lut
+            )
+
+            # Verify collocation_indices.npy was saved and has 5 entries
+            colloc_path = 'models/reduced_lut/collocation_indices.npy'
+            self.assertTrue(os.path.exists(colloc_path))
+            colloc_idx = np.load(colloc_path)
+            self.assertEqual(len(colloc_idx), 5)
+
+            # Verify plotting does not crash despite positions ≠ n_nodes_x
+            xi_prime = reducer.predict(X_test)
+            Y_pred = lut.predict(xi_prime)
+            n_x = cfg['solver']['n_nodes_x']
+            x_positions = np.linspace(0.0, 1.0, n_x)
+
+            out_dir = 'results/colloc_5pos/plots'
+            viz = Visualization(plots_dir=out_dir)
+            # Should not raise any shape-mismatch error
+            viz.plot_settlement_comparison(Y_test, Y_pred, n_samples=2,
+                                           x_positions=x_positions)
+            viz.plot_settlement_comparison_with_collocation(
+                Y_test, Y_pred, lut, n_samples=2,
+                x_positions=x_positions,
+                colloc_idx=colloc_idx,
+            )
+            self.assertTrue(
+                os.path.exists(os.path.join(
+                    out_dir, 'settlement_comparison', 'comparison.png'
+                ))
+            )
+            self.assertTrue(
+                os.path.exists(os.path.join(
+                    out_dir, 'settlement_comparison', 'comparison_with_collocation.png'
+                ))
+            )
+        finally:
+            os.chdir(orig)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_collocation_indices_consistent_phase3_and_plot(self):
+        """Collocation indices from _compute_collocation_indices must match the
+        saved artifact and can be used identically for Phase-3 loss and markers."""
+        from src.training_pipeline import TrainingPipeline
+        import tempfile, shutil
+
+        cfg = _make_smoke_config()
+        cfg['solver']['n_nodes_x'] = 20
+        cfg['collocation'] = {'positions': [0.0, 0.5, 1.0]}
+
+        tmp = tempfile.mkdtemp(prefix='pi_colloc_consist_')
+        orig = os.getcwd()
+        try:
+            os.chdir(tmp)
+            pipeline = TrainingPipeline(cfg, output_dir='results/colloc_consist')
+            X, Y = pipeline.phase1_generate_dataset()
+            lut = pipeline.phase2_build_reduced_surrogate()
+            pipeline.phase3_train_dimension_reducer(X, Y, lut)
+
+            # The saved artifact must equal what _compute_collocation_indices returns
+            colloc_idx_saved = np.load('models/reduced_lut/collocation_indices.npy')
+            colloc_idx_computed = TrainingPipeline._compute_collocation_indices(
+                cfg, n_nodes_x=20, length_x=1.0
+            )
+            np.testing.assert_array_equal(colloc_idx_saved, colloc_idx_computed)
+
+            # Indices must correspond to 3 positions (0.0→0, 0.5→10, 1.0→19)
+            x_grid = np.linspace(0.0, 1.0, 20)
+            dx = 1.0 / (20 - 1)  # grid spacing for n_nodes_x=20
+            for pos, idx in zip([0.0, 0.5, 1.0], np.sort(colloc_idx_saved)):
+                self.assertAlmostEqual(x_grid[idx], pos, delta=dx + 1e-9)
+        finally:
+            os.chdir(orig)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_null_collocation_config_defaults_to_all_nodes(self):
+        """When collocation config is null/missing, _compute_collocation_indices
+        must return all n_nodes_x indices and must not crash."""
+        from src.training_pipeline import TrainingPipeline
+        import tempfile, shutil
+
+        # Case 1: collocation key absent
+        cfg_absent = _make_smoke_config()
+        cfg_absent.pop('collocation', None)
+
+        tmp = tempfile.mkdtemp(prefix='pi_colloc_null_')
+        orig = os.getcwd()
+        try:
+            os.chdir(tmp)
+            for label, cfg in [('absent', cfg_absent),
+                                ('null', dict(_make_smoke_config(), collocation=None)),
+                                ('empty', dict(_make_smoke_config(), collocation={}))]:
+                idx = TrainingPipeline._compute_collocation_indices(
+                    cfg, n_nodes_x=10, length_x=1.0
+                )
+                self.assertEqual(
+                    len(idx), 10,
+                    f"Expected all 10 nodes for '{label}' collocation config, got {len(idx)}"
+                )
+                np.testing.assert_array_equal(idx, np.arange(10))
+
+            # Full pipeline smoke – should not crash at any phase
+            pipeline = TrainingPipeline(
+                dict(_make_smoke_config(), collocation=None),
+                output_dir='results/colloc_null',
+            )
+            pipeline.orchestrate(phases=[1, 2, 3, 4])
+        finally:
+            os.chdir(orig)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == '__main__':
     unittest.main()
