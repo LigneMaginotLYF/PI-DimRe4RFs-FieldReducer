@@ -94,6 +94,16 @@ random_field:
   length_scale_range: [0.1, 0.5]
   length_scale_ref: 0.3   # fixed ℓ used when length_scale_sampling = false
 
+  # Per-sample mean variation (DCT basis only).
+  # When E_ref_sampling=true, each sample draws a scaling factor from
+  # Uniform(E_ref_factor_range) so that the expected field mean equals
+  # material.E_ref * factor.  The mean shift is encoded into the DC DCT
+  # coefficient (index 0, mode (0,0)) so the xi vector alone carries the
+  # mean information without requiring E_ref_factor as a separate input.
+  # Has no effect when field_basis != "dct".
+  E_ref_sampling: false
+  E_ref_factor_range: [0.5, 1.5]
+
 dimension_reducer:
   # Reduced-space dimension.
   # How many scalar parameters describe the low-dimensional material field.
@@ -158,6 +168,28 @@ surrogate:
   # e.g. ["nn", "pce"] to train both and produce a comparison plot.
   # If omitted, defaults to [type] above.
   # types: ["nn", "pce"]
+
+  # Output representation for the Phase-2 surrogate.
+  # Allowed values: "direct" | "dct"
+  # "direct" (default): surrogate predicts full settlement profile Y(x) directly.
+  # "dct"             : surrogate predicts n_output_modes DCT-II coefficients of
+  #                     the settlement profile.  predict() applies inverse DCT to
+  #                     return full Y(x).  Smoother (C²) predictions due to truncated
+  #                     DCT basis; helps avoid oscillatory artifacts.
+  output_representation: "direct"
+
+  # Number of 1D DCT modes to use for the surrogate output.
+  # Only used when output_representation = "dct".
+  # Smaller values give smoother predictions; larger values retain more detail.
+  n_output_modes: 8
+
+phase4:
+  # Use direct Biot solver (not surrogate) for the 5 settlement comparison plots.
+  # Plots isolate reducer + reduced-field error and avoid Phase-2 oscillations.
+  # Metrics are still computed from surrogate predictions for speed.
+  # Set to false to use surrogate predictions for plots (faster but may show
+  # Phase-2 surrogate oscillations in the comparison curves).
+  use_direct_physics_for_plots: true
 
 collocation:
   # Number of collocation points used in Phase-3 physics-driven training.

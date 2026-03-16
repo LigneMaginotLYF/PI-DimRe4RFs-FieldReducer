@@ -96,6 +96,7 @@ class Visualization:
             ax.set_ylabel('Settlement [m]')
             ax.legend()
             ax.grid(True, alpha=0.3)
+            ax.set_ylim(bottom=0.0)
 
         plt.tight_layout()
         path = os.path.join(self.plots_dir, 'settlement_comparison', 'comparison.png')
@@ -305,8 +306,14 @@ class Visualization:
         if x_positions is None:
             x_positions = np.arange(n_x)
 
+        # Ensure x_positions matches n_x (full grid), not collocation subset
+        if len(x_positions) != n_x:
+            x_positions = np.linspace(x_positions[0], x_positions[-1], n_x)
+
         # Collocation x-positions for markers
         if colloc_idx is not None:
+            # Guard against indices exceeding current n_x
+            colloc_idx = colloc_idx[colloc_idx < n_x]
             colloc_x = x_positions[colloc_idx]
         else:
             colloc_x = x_positions
@@ -337,6 +344,7 @@ class Visualization:
             ax.set_ylabel('Settlement [m]')
             ax.legend(fontsize=9)
             ax.grid(True, alpha=0.3)
+            ax.set_ylim(bottom=0.0)
 
         plt.tight_layout()
         path = os.path.join(self.plots_dir, 'settlement_comparison',
@@ -373,7 +381,7 @@ class Visualization:
 
         X_val = reduced_lut.grid_points[val_idx]
         Y_val = reduced_lut.responses[val_idx]
-        Y_pred_val = reduced_lut.surrogate.predict(X_val)
+        Y_pred_val = reduced_lut.predict(X_val)
 
         surr_dir = os.path.join(self.plots_dir, 'phase2_surrogate')
         os.makedirs(surr_dir, exist_ok=True)
@@ -413,6 +421,7 @@ class Visualization:
             ax.set_title(f'LUT point {val_idx[i]}')
             ax.legend(fontsize=8)
             ax.grid(True, alpha=0.3)
+            ax.set_ylim(bottom=0.0)
         plt.tight_layout()
         profiles_path = os.path.join(surr_dir, f'profiles_{surrogate_type}.png')
         plt.savefig(profiles_path, dpi=100, bbox_inches='tight')

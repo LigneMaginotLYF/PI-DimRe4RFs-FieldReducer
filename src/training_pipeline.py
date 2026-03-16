@@ -68,7 +68,7 @@ class TrainingPipeline:
         self.timings = {}
 
     def _get_solver(self):
-        solver_type = self.config.get('solver', {}).get('type', '2d')
+        solver_type = (self.config.get('solver') or {}).get('type', '2d')
         if solver_type == '1d':
             from src.forward_solver_1d import BiotSolver1D
             return BiotSolver1D(self.config)
@@ -77,9 +77,9 @@ class TrainingPipeline:
             return BiotSolver2D(self.config)
 
     def _get_field_generator(self):
-        sol = self.config.get('solver', {})
-        dom = self.config.get('domain', {})
-        rf_cfg = self.config.get('random_field', {})
+        sol = self.config.get('solver') or {}
+        dom = self.config.get('domain') or {}
+        rf_cfg = self.config.get('random_field') or {}
         field_basis = rf_cfg.get('field_basis', 'kl')
         if field_basis == 'dct':
             from src.field_generator import DCTField
@@ -181,10 +181,10 @@ class TrainingPipeline:
         logger.info("PHASE 1: Generating original dataset")
         logger.info("=" * 60)
 
-        ds_cfg = self.config.get('dataset', {})
-        mat_cfg = self.config.get('material', {})
-        rf_cfg = self.config.get('random_field', {})
-        sol_cfg = self.config.get('solver', {})
+        ds_cfg = self.config.get('dataset') or {}
+        mat_cfg = self.config.get('material') or {}
+        rf_cfg = self.config.get('random_field') or {}
+        sol_cfg = self.config.get('solver') or {}
 
         n_samples = n_samples or ds_cfg.get('n_samples', 500)
         seed = seed if seed is not None else ds_cfg.get('seed', 42)
@@ -195,6 +195,10 @@ class TrainingPipeline:
         n_x = sol_cfg.get('n_nodes_x', 20)
         logE_std = rf_cfg.get('logE_std', rf_cfg.get('field_fluctuation_scale', 1.0))
         field_basis = rf_cfg.get('field_basis', 'kl')
+
+        # Per-sample E_ref sampling (DCT basis only): encodes mean shift in DC coefficient
+        e_ref_sampling = rf_cfg.get('E_ref_sampling', False)
+        e_ref_factor_range = rf_cfg.get('E_ref_factor_range', [0.5, 1.5])
 
         # Resolve save paths (allow config override)
         x_path = ds_cfg.get('path_X', os.path.join(self.data_dir, 'X_train.npy'))
@@ -224,15 +228,24 @@ class TrainingPipeline:
         X_train = np.zeros((n_samples, n_terms))
         Y_train = np.zeros((n_samples, n_x))
 
+        if e_ref_sampling and field_basis == 'dct':
+            logger.info(
+                f"Phase 1: E_ref_sampling=True, factor_range={e_ref_factor_range}, "
+                "mean encoded in DC DCT coefficient"
+            )
+
         for i in range(n_samples):
             if i % 50 == 0:
                 logger.info(f"Phase 1: sample {i}/{n_samples}")
             nu = rng.uniform(*nu_range) if nu_sampling else nu_ref
             length_scale = rng.uniform(*ls_range) if ls_sampling else ls_ref
             if field_basis == 'dct':
+                # Optionally sample per-sample E_ref_factor and encode in DC coefficient
+                factor = rng.uniform(*e_ref_factor_range) if e_ref_sampling else None
                 xi_E, E_field = field_gen.generate_field(
                     rng, nu, length_scale,
                     n_terms=n_terms, E_ref=E_ref, logE_std=logE_std,
+                    E_ref_factor=factor,
                 )
             else:
                 xi_E = rng.standard_normal(n_terms)
@@ -271,10 +284,10 @@ class TrainingPipeline:
         logger.info("PHASE 2: Building reduced surrogate (LUT) -- always recomputing")
         logger.info("=" * 60)
 
-        ds_cfg = self.config.get('dataset', {})
-        surr_cfg = self.config.get('surrogate', {})
-        lut_cfg = self.config.get('reduced_lut', {})
-        val_cfg = self.config.get('validation', {})
+        ds_cfg = self.config.get('dataset') or {}
+        surr_cfg = self.config.get('surrogate') or {}
+        lut_cfg = self.config.get('reduced_lut') or {}
+        val_cfg = self.config.get('validation') or {}
         seed = seed if seed is not None else ds_cfg.get('seed', 42)
 
         # Support a list of types for simultaneous training
@@ -353,8 +366,14 @@ class TrainingPipeline:
         X_test = lut.grid_points[test_idx]
         Y_test = lut.responses[test_idx]
 
-        Y_pred = lut.surrogate.predict(X_test)
+        Y_pred = lut.predict(X_test)
         metrics = Validation.compute_metrics(Y_pred, Y_test)
+
+        # Roughness metric: mean L2 norm of first differences ||ΔY||
+        roughness_gt = float(np.mean(np.sqrt(np.mean(np.diff(Y_test, axis=1) ** 2, axis=1))))
+        roughness_pred = float(np.mean(np.sqrt(np.mean(np.diff(Y_pred, axis=1) ** 2, axis=1))))
+        metrics['roughness_gt'] = roughness_gt
+        metrics['roughness_pred'] = roughness_pred
 
         eval_dir = os.path.join(self.models_dir, 'reduced_lut', surrogate_type, 'evaluation')
         os.makedirs(eval_dir, exist_ok=True)
@@ -369,7 +388,8 @@ class TrainingPipeline:
         r2_str = f"{metrics['r2']:.4f}" if metrics['r2'] is not None else "N/A"
         logger.info(
             f"Phase 2 [{surrogate_type}] independent eval: R2={r2_str}, "
-            f"RMSE={metrics['rmse']:.4e}, relL2={metrics['rel_l2']:.4f} "
+            f"RMSE={metrics['rmse']:.4e}, relL2={metrics['rel_l2']:.4f}, "
+            f"roughness_gt={roughness_gt:.4e}, roughness_pred={roughness_pred:.4e} "
             f"(saved to {eval_dir})"
         )
         return metrics
@@ -391,12 +411,12 @@ class TrainingPipeline:
         logger.info("PHASE 3: Training dimension reducer")
         logger.info("=" * 60)
 
-        ds_cfg = self.config.get('dataset', {})
-        surr_cfg = self.config.get('surrogate', {})
-        red_cfg = self.config.get('dimension_reducer', {})
-        val_cfg = self.config.get('validation', {})
-        sol_cfg = self.config.get('solver', {})
-        dom_cfg = self.config.get('domain', {})
+        ds_cfg = self.config.get('dataset') or {}
+        surr_cfg = self.config.get('surrogate') or {}
+        red_cfg = self.config.get('dimension_reducer') or {}
+        val_cfg = self.config.get('validation') or {}
+        sol_cfg = self.config.get('solver') or {}
+        dom_cfg = self.config.get('domain') or {}
         seed = seed if seed is not None else ds_cfg.get('seed', 42)
 
         # Compute collocation indices – single source of truth for Phase-3 + Phase-4
@@ -532,6 +552,11 @@ class TrainingPipeline:
         All plots are saved under <output_dir>/plots/ (per-run directory).
         When reducer is a dict {type: model}, evaluates all types and produces
         a comparison plot.
+
+        Settlement-comparison plots (n_samples=5) use direct Biot solver predictions
+        by default (phase4.use_direct_physics_for_plots=true) so that plots isolate
+        reducer + reduced-field error, not Phase-2 surrogate oscillations.
+        Metrics are always computed from surrogate predictions for speed.
         """
         t0 = time.time()
         logger.info("=" * 60)
@@ -559,19 +584,19 @@ class TrainingPipeline:
             primary_reducer = reducer
             metrics = self._evaluate_single_reducer(reducer, reduced_lut, X_test, Y_test, run_id)
 
-        # Settlement comparison + aggregate metric plots
+        # Surrogate-based predictions for metrics
         xi_prime_pred = primary_reducer.predict(X_test)
         Y_pred = reduced_lut.predict(xi_prime_pred)
 
         # Identity-mode equivalence check
-        red_cfg = self.config.get('dimension_reducer', {})
+        red_cfg = self.config.get('dimension_reducer') or {}
         if red_cfg.get('mode', 'learned') == 'identity':
             identity_report = self._run_identity_check(X_test, Y_test, reduced_lut)
             metrics.update(identity_report)
 
         # Physical x-positions for settlement comparison plots
-        dom_cfg = self.config.get('domain', {})
-        sol_cfg = self.config.get('solver', {})
+        dom_cfg = self.config.get('domain') or {}
+        sol_cfg = self.config.get('solver') or {}
         n_x = sol_cfg.get('n_nodes_x', 20)
         length_x = dom_cfg.get('length_x', 1.0)
         # Always use the full x-grid for the curve; collocation positions are
@@ -591,8 +616,35 @@ class TrainingPipeline:
                 self.config, n_x, length_x
             )
 
-        viz.plot_settlement_comparison(Y_test, Y_pred, n_samples=5,
-                                       x_positions=x_positions)
+        # --- Settlement comparison plots (direct physics by default) ---
+        p4_cfg = self.config.get('phase4') or {}
+        use_direct_physics = p4_cfg.get('use_direct_physics_for_plots', True)
+        n_plot = min(5, len(X_test))
+        rng_plot = np.random.default_rng(42)
+        plot_indices = rng_plot.choice(len(X_test), size=n_plot, replace=False)
+
+        if use_direct_physics:
+            Y_plot_pred = self._compute_direct_physics_predictions(
+                xi_prime_pred[plot_indices], reduced_lut
+            )
+            Y_plot_true = Y_test[plot_indices]
+            if Y_plot_pred is not None:
+                logger.info(
+                    "Phase 4: settlement comparison plots use direct Biot solver "
+                    "(phase4.use_direct_physics_for_plots=true)"
+                )
+                viz.plot_settlement_comparison(
+                    Y_plot_true, Y_plot_pred, n_samples=n_plot,
+                    x_positions=x_positions,
+                )
+            else:
+                # Fallback if direct physics fails
+                viz.plot_settlement_comparison(Y_test, Y_pred, n_samples=5,
+                                               x_positions=x_positions)
+        else:
+            viz.plot_settlement_comparison(Y_test, Y_pred, n_samples=5,
+                                           x_positions=x_positions)
+
         viz.plot_aggregate_metrics(Y_test, Y_pred)
         viz.plot_sobol_sensitivity(primary_reducer, input_dim=X_test.shape[1])
 
@@ -620,6 +672,41 @@ class TrainingPipeline:
         self.timings['phase4'] = time.time() - t0
         logger.info(f"Phase 4 done in {self.timings['phase4']:.1f}s")
         return metrics
+
+    def _compute_direct_physics_predictions(self, xi_prime_samples, reduced_lut):
+        """
+        Compute settlement predictions via direct Biot solver on reconstructed fields.
+
+        For each sample in xi_prime_samples, reconstructs the E field and runs the
+        solver directly.  Used for qualitative Phase-4 plots to isolate
+        reducer + reduced-field error from Phase-2 surrogate oscillations.
+
+        Args:
+            xi_prime_samples: shape (n, d) – reduced parameters for n plot samples
+            reduced_lut: ReducedLUT instance (provides _reconstruct_field)
+
+        Returns:
+            Y_direct: shape (n, n_x) or None if an error occurs
+        """
+        try:
+            solver = self._get_solver()
+            mat_cfg = self.config.get('material') or {}
+            k_h = mat_cfg.get('permeability_h', 1.0e-12)
+            k_v = mat_cfg.get('permeability_v', 1.0e-12)
+            n = len(xi_prime_samples)
+            sol_cfg = self.config.get('solver') or {}
+            n_x = sol_cfg.get('n_nodes_x', 20)
+            Y_direct = np.zeros((n, n_x))
+            for i, xi in enumerate(xi_prime_samples):
+                E_field = reduced_lut._reconstruct_field(xi)
+                Y_direct[i] = solver.run(E_field, k_h, k_v)
+            return Y_direct
+        except (ValueError, RuntimeError, ArithmeticError, np.linalg.LinAlgError) as exc:
+            logger.warning(
+                f"Direct-physics plot generation failed ({type(exc).__name__}: {exc}); "
+                "falling back to surrogate predictions for plots."
+            )
+            return None
 
     def _evaluate_single_reducer(self, reducer, reduced_lut, X_test, Y_test, run_id):
         """Evaluate a single reducer and return metrics dict."""
@@ -652,9 +739,9 @@ class TrainingPipeline:
         """
         from src.validation import Validation
 
-        rf_cfg = self.config.get('random_field', {})
-        ds_cfg = self.config.get('dataset', {})
-        mat_cfg = self.config.get('material', {})
+        rf_cfg = self.config.get('random_field') or {}
+        ds_cfg = self.config.get('dataset') or {}
+        mat_cfg = self.config.get('material') or {}
         n_terms = self._resolve_n_terms(ds_cfg)
         E_ref = mat_cfg.get('E_ref', 10.0e6)
         k_h = mat_cfg.get('permeability_h', 1.0e-12)
@@ -733,14 +820,14 @@ class TrainingPipeline:
         them to the reduced E' field derived from the predicted xi' via basis reconstruction.
         k_h and k_v are taken from config (fixed material permeabilities).
         """
-        mat_cfg = self.config.get('material', {})
+        mat_cfg = self.config.get('material') or {}
         E_ref = mat_cfg.get('E_ref', 10.0e6)
         k_h = mat_cfg.get('permeability_h', 1.0e-12)
         k_v = mat_cfg.get('permeability_v', 1.0e-12)
 
         field_gen = self._get_field_generator()
-        rf_cfg = self.config.get('random_field', {})
-        ds_cfg = self.config.get('dataset', {})
+        rf_cfg = self.config.get('random_field') or {}
+        ds_cfg = self.config.get('dataset') or {}
         n_terms = self._resolve_n_terms(ds_cfg)
         nu_range = rf_cfg.get('nu_range', [0.5, 2.5])
         ls_range = rf_cfg.get('length_scale_range', [0.1, 0.5])
@@ -748,7 +835,7 @@ class TrainingPipeline:
         logE_std = rf_cfg.get('logE_std', rf_cfg.get('field_fluctuation_scale', 1.0))
 
         n = min(n_samples, len(X_test))
-        seed = self.config.get('dataset', {}).get('seed', 42)
+        seed = (self.config.get('dataset') or {}).get('seed', 42)
         rng = np.random.default_rng(seed)
 
         E_fields = []
@@ -878,7 +965,7 @@ class TrainingPipeline:
             from src.reduced_lut import ReducedLUT
             solver = self._get_solver()
             lut_dir = os.path.join(self.models_dir, 'reduced_lut')
-            surr_cfg = self.config.get('surrogate', {})
+            surr_cfg = self.config.get('surrogate') or {}
             surr_types = surr_cfg.get('types', None)
             if surr_types is None:
                 surr_types = [surr_cfg.get('type', 'nn')]
@@ -894,8 +981,8 @@ class TrainingPipeline:
             X_test = np.load(os.path.join(self.data_dir, 'X_test.npy'))
             Y_test = np.load(os.path.join(self.data_dir, 'Y_test.npy'))
             # Load saved reducer model
-            surr_cfg = self.config.get('surrogate', {})
-            red_cfg = self.config.get('dimension_reducer', {})
+            surr_cfg = self.config.get('surrogate') or {}
+            red_cfg = self.config.get('dimension_reducer') or {}
             reducer_types = red_cfg.get('types', None)
             if reducer_types is None:
                 surrogate_type = surr_cfg.get('type', 'nn')
@@ -917,7 +1004,11 @@ class TrainingPipeline:
         if reducer_type == 'nn':
             import torch
             reducer_path = os.path.join(self.models_dir, 'dimension_reducer_nn.pt')
-            return torch.load(reducer_path, weights_only=False)
+            try:
+                return torch.load(reducer_path, weights_only=False)
+            except TypeError:
+                # Torch < 1.13 does not accept weights_only kwarg
+                return torch.load(reducer_path)
         else:
             import pickle
             reducer_path = os.path.join(self.models_dir, f'dimension_reducer_{reducer_type}.pkl')
