@@ -224,7 +224,7 @@ class DCTField:
         return sigma_k
 
     def generate_field(self, rng, nu, length_scale, n_terms=5, E_ref=10.0e6,
-                       logE_std=1.0):
+                       logE_std=1.0, E_ref_factor=None):
         """
         Draw a random DCT-basis log-E field and return the E field.
 
@@ -239,20 +239,53 @@ class DCTField:
         n_terms : int
             Number of DCT modes to use.
         E_ref : float
-            Reference Young's modulus [Pa].
+            Reference (base) Young's modulus [Pa].  Always used as the base;
+            per-sample mean shifts are encoded in the DC DCT coefficient.
         logE_std : float
             Global amplitude multiplier on logE (default 1.0; decrease to smooth GT).
+        E_ref_factor : float or None
+            When provided (not None), encode the per-sample mean shift into the
+            DC DCT coefficient (index 0, mode (m=0, n=0)) so that the expected
+            spatial mean of E equals ``E_ref * E_ref_factor``.
+
+            The DC mode contributes ``a_0 * psi_0`` uniformly across the grid,
+            where ``psi_0 = 1 / sqrt(n_pts)`` (unit-norm constant vector).
+            Setting ``a_0 = log(factor) * sqrt(n_pts) / logE_std`` gives::
+
+                <logE> = logE_std * a_0 / sqrt(n_pts) = log(factor)
+
+            and therefore ``<E> ≈ E_ref * exp(log(factor)) = E_ref * factor``.
+
+            The higher-order DCT coefficients (k >= 1) are sampled from their
+            Matérn-shaped distribution, encoding field fluctuations.  The full
+            xi vector (with the assigned DC component) is returned as the input
+            feature, so the coefficient vector alone carries the mean information
+            without requiring E_ref_factor as a separate input.
+
+            When ``E_ref_factor is None`` the DC coefficient is also drawn from
+            the Matérn distribution (original behaviour).
 
         Returns
         -------
         xi : ndarray, shape (n_terms,)
             Sampled DCT coefficients (stored as the "input" features X in Phase 1).
+            When ``E_ref_factor`` is provided, ``xi[0]`` encodes the mean shift.
         E_field : ndarray, shape (n_nodes_z, n_nodes_x)
             Young's modulus field.
         """
         Psi, mode_freqs = self.compute_dct_basis(n_terms)
         sigma_k = self.matern_spectral_variance(nu, length_scale, mode_freqs)
         xi = rng.standard_normal(n_terms) * sigma_k
+
+        if E_ref_factor is not None:
+            # Override DC coefficient (index 0) to encode the desired mean shift.
+            # psi_0 = 1/sqrt(n_pts) everywhere, so:
+            #   <logE> = logE_std * xi[0] / sqrt(n_pts) = log(factor)
+            # => xi[0] = log(factor) * sqrt(n_pts) / logE_std
+            n_pts = self.n_nodes_x * self.n_nodes_z
+            safe_std = logE_std if abs(logE_std) > 1e-12 else 1.0
+            xi[0] = np.log(float(E_ref_factor)) * np.sqrt(n_pts) / safe_std
+
         log_E = logE_std * (Psi @ xi)
         E = E_ref * np.exp(np.clip(log_E, -10, 10))
         return xi, E.reshape(self.n_nodes_z, self.n_nodes_x)

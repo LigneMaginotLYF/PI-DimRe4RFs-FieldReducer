@@ -89,6 +89,8 @@ Parameters for sampling random material fields in Phase 1.
 | `length_scale_sampling` | bool | true | — | If `true`, length scale ℓ is drawn from `length_scale_range` per sample. |
 | `length_scale_range` | [float, float] | [0.1, 0.5] | — | Uniform range for the correlation length scale. |
 | `length_scale_ref` | float | 0.3 | — | Fixed ℓ used when `length_scale_sampling: false`. Also used as the KL-basis reference when `basis_type: "kl"`. |
+| `E_ref_sampling` | bool | false | — | **Per-sample mean variation** (DCT basis only). When `true`, each sample draws a factor `f ~ Uniform(E_ref_factor_range)` and encodes it into the DC DCT coefficient so that the expected field mean equals `material.E_ref * f`. This increases the mean-level diversity in the training set without requiring `f` as a separate input feature. Has no effect when `field_basis != "dct"`. |
+| `E_ref_factor_range` | [float, float] | [0.5, 1.5] | — | Uniform range for the per-sample E_ref scaling factor. Only used when `E_ref_sampling: true`. |
 
 ### DCT basis notes
 
@@ -105,6 +107,17 @@ When `field_basis: "dct"`:
   so the mapping M: ξ_E → ξ' is trained on these scaled coefficients.
 - Set `dimension_reducer.basis_type: "dct"` in Phase 2 to use the same DCT
   modes for LUT reconstruction (basis consistency).
+
+### DC coefficient mean encoding
+
+When `E_ref_sampling: true` (DCT basis only):
+- A per-sample factor `f ~ Uniform(E_ref_factor_range)` is drawn.
+- The DC DCT coefficient `ξ_E[0]` (mode (0,0)) is **overwritten** to encode the
+  desired mean shift: `ξ_E[0] = log(f) * √(n_pts) / σ_0`, where `σ_0` is the
+  Matérn spectral standard deviation of the DC mode.
+- This means the coefficient vector alone carries the mean information — no extra
+  input feature (e.g. `E_ref_factor`) is added to `X_train`.
+- The target is that `mean(E_field) ≈ E_ref * f` in expectation.
 
 **For identity-mode verification**, set both `nu_sampling: false` and `length_scale_sampling: false` so that Phase-1 generation and Phase-2 reconstruction share the same KL/DCT basis parameters (→ machine-precision equivalence).
 
@@ -156,6 +169,40 @@ Settings for the Phase-2 surrogate S: ξ' → Y and the Phase-3 reducer backbone
 | `epochs` | int | 200 | — | Training epochs. |
 | `learning_rate` | float | 1.0e-3 | — | Initial Adam learning rate. |
 | `batch_size` | int | 64 | — | Mini-batch size. |
+| `output_representation` | str | `"direct"` | `"direct"`, `"dct"` | **Output representation for Phase-2 surrogate.** `"direct"` (default): surrogate predicts the full settlement profile Y(x) directly. `"dct"`: surrogate predicts the first `n_output_modes` 1-D DCT-II coefficients of Y(x); `predict()` applies the inverse DCT to return the full reconstructed profile. DCT output avoids oscillatory artefacts by constraining the predicted curve to a smooth (C²) function basis. |
+| `n_output_modes` | int | 8 | — | Number of 1-D DCT modes used when `output_representation: "dct"`. Smaller values give smoother (lower-frequency) predictions; increase for more spatial detail. Has no effect when `output_representation: "direct"`. |
+
+### Surrogate DCT output representation
+
+When `output_representation: "dct"`:
+- The settlement profile `Y(x)` of length `n_nodes_x` is transformed to DCT-II coefficients before training.
+- The surrogate is trained to predict the first `n_output_modes` coefficients.
+- At inference, `ReducedLUT.predict()` pads the truncated coefficient vector to length `n_nodes_x` and applies the inverse DCT to recover the full settlement profile.
+- **Smoother outputs**: because the inverse DCT reconstructs from a low-order basis, the predictions are guaranteed to be smooth (band-limited), which prevents the oscillatory artefacts that can appear with direct node-by-node prediction.
+- **Roughness metric**: Phase-2 evaluation logs a roughness diagnostic (`mean ||ΔY||`) for both ground-truth and predicted profiles; compare these values to detect oscillatory predictions.
+
+> **Tip**: Start with `n_output_modes: 8` (captures the dominant settlement shape).
+> Increase if validation R² is low due to missing high-frequency detail.
+
+---
+
+## `phase4`
+
+Settings controlling Phase-4 evaluation and visualization behaviour.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `use_direct_physics_for_plots` | bool | `true` | **Use direct Biot solver for settlement-comparison plots** (5 sample curves). When `true`, the pipeline reconstructs the E field from the predicted reduced parameters ξ' and runs the full solver to compute Y_pred for each plot sample. This isolates reducer + reduced-field error in the plots, avoiding Phase-2 surrogate oscillations from contaminating the visual comparison. **Metrics** (R², RMSE, etc.) always use surrogate predictions for speed regardless of this setting. Set to `false` to use surrogate predictions for both plots and metrics. |
+
+### Direct-physics plots (Phase 4)
+
+When `use_direct_physics_for_plots: true` (default), the 5-sample settlement comparison plots are produced as follows:
+
+1. `xi' = reducer.predict(X_test)` — reduced parameters for each test sample.
+2. `E' = reduced_lut._reconstruct_field(xi')` — reconstruct the E field from ξ'.
+3. `Y_plot = solver.run(E', k_h, k_v)` — run the Biot solver directly.
+
+These direct-physics curves isolate the error introduced by the dimension reducer and the reduced-field approximation, independently of any Phase-2 surrogate artefacts.
 
 ---
 

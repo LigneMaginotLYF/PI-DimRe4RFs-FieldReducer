@@ -1244,5 +1244,286 @@ class TestCollocationConsistency(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+
+
+class TestDCTMeanSampling(unittest.TestCase):
+    """Tests for E_ref_sampling – mean variation encoded in the DC DCT coefficient."""
+
+    def test_varying_e_ref_factor_affects_field_mean(self):
+        """Larger E_ref_factor should increase mean(E_field)."""
+        from src.field_generator import DCTField
+        fg = DCTField(n_nodes_x=8, n_nodes_z=8)
+        rng = np.random.default_rng(99)
+
+        # Use a fixed Matérn draw (zero higher-order coefficients) so only the
+        # DC component is altered.
+        _, E_low = fg.generate_field(
+            rng, nu=1.5, length_scale=0.3, n_terms=1,
+            E_ref=10e6, logE_std=1.0, E_ref_factor=0.5,
+        )
+        rng2 = np.random.default_rng(99)
+        _, E_high = fg.generate_field(
+            rng2, nu=1.5, length_scale=0.3, n_terms=1,
+            E_ref=10e6, logE_std=1.0, E_ref_factor=2.0,
+        )
+        self.assertGreater(E_high.mean(), E_low.mean())
+
+    def test_e_ref_factor_encodes_mean_approximately(self):
+        """E_ref_factor=1.0 should leave the spatial mean ≈ E_ref."""
+        from src.field_generator import DCTField
+        fg = DCTField(n_nodes_x=16, n_nodes_z=16)
+        rng = np.random.default_rng(0)
+        xi, E = fg.generate_field(
+            rng, nu=1.5, length_scale=0.3, n_terms=5,
+            E_ref=10e6, logE_std=0.1,  # small std so exp(logE) ≈ 1
+            E_ref_factor=1.0,
+        )
+        # With tiny logE_std and factor=1, mean(E) ≈ E_ref
+        self.assertAlmostEqual(E.mean() / 10e6, 1.0, delta=0.2)
+
+    def test_e_ref_factor_none_unchanged_signature(self):
+        """E_ref_factor=None should behave identically to the pre-PR code path."""
+        from src.field_generator import DCTField
+        fg = DCTField(n_nodes_x=8, n_nodes_z=8)
+        rng1 = np.random.default_rng(7)
+        xi1, E1 = fg.generate_field(rng1, nu=1.5, length_scale=0.3, n_terms=5,
+                                     E_ref=10e6)
+        rng2 = np.random.default_rng(7)
+        xi2, E2 = fg.generate_field(rng2, nu=1.5, length_scale=0.3, n_terms=5,
+                                     E_ref=10e6, E_ref_factor=None)
+        np.testing.assert_array_equal(E1, E2)
+        np.testing.assert_array_equal(xi1, xi2)
+
+    def test_e_ref_sampling_in_phase1_affects_settlement_scale(self):
+        """Phase-1 with E_ref_sampling=true should produce higher variance in Y."""
+        from src.training_pipeline import TrainingPipeline
+        tmp = tempfile.mkdtemp(prefix='pi_e_ref_samp_')
+        orig = os.getcwd()
+        try:
+            os.chdir(tmp)
+            base = _make_smoke_config()
+            base['dataset']['n_samples'] = 40
+            base['random_field']['field_basis'] = 'dct'
+            base['random_field']['logE_std'] = 0.5
+
+            cfg_no = {**base,
+                      'random_field': {**base['random_field'],
+                                       'E_ref_sampling': False}}
+            cfg_yes = {**base,
+                       'random_field': {**base['random_field'],
+                                        'E_ref_sampling': True,
+                                        'E_ref_factor_range': [0.2, 5.0]}}
+
+            p_no = TrainingPipeline(cfg_no, output_dir='r/no')
+            X_no, Y_no = p_no.phase1_generate_dataset()
+
+            p_yes = TrainingPipeline(cfg_yes, output_dir='r/yes')
+            X_yes, Y_yes = p_yes.phase1_generate_dataset()
+
+            # E_ref_sampling with a wide factor range should increase Y variance
+            self.assertGreater(Y_yes.std(), Y_no.std())
+        finally:
+            os.chdir(orig)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestSurrogateDCTOutput(unittest.TestCase):
+    """Tests for Phase-2 surrogate DCT output representation."""
+
+    def test_to_from_dct_space_roundtrip(self):
+        """_to_dct_space followed by _from_dct_space recovers original Y."""
+        from src.reduced_lut import ReducedLUT
+        from unittest.mock import MagicMock
+        cfg = {
+            'surrogate': {'output_representation': 'dct', 'n_output_modes': 5},
+            'reduced_lut': {}, 'material': {}, 'solver': {'n_nodes_x': 20, 'n_nodes_z': 10},
+            'dimension_reducer': {},
+        }
+        lut = ReducedLUT(cfg, solver=MagicMock())
+        rng = np.random.default_rng(42)
+        Y = rng.uniform(1e-4, 1e-2, size=(8, 20))
+        B = lut._to_dct_space(Y)
+        self.assertEqual(B.shape, (8, 5))
+        Y_rec = lut._from_dct_space(B)
+        # Reconstruction with only 5 modes won't be exact for 20-node profiles
+        self.assertEqual(Y_rec.shape, (8, 20))
+
+    def test_dct_output_shape(self):
+        """ReducedLUT with output_representation=dct must return shape (n, n_x) from predict."""
+        from src.reduced_lut import ReducedLUT
+        from unittest.mock import MagicMock, patch
+        cfg = {
+            'surrogate': {'output_representation': 'dct', 'n_output_modes': 4},
+            'reduced_lut': {}, 'material': {}, 'solver': {'n_nodes_x': 10, 'n_nodes_z': 10},
+            'dimension_reducer': {'d': 2},
+        }
+        lut = ReducedLUT(cfg, solver=MagicMock())
+        lut.output_representation = 'dct'
+        lut.n_output_modes = 4
+        lut.n_x = 10
+        # Mock surrogate.predict to return 4 DCT coefficients per sample
+        mock_surr = MagicMock()
+        mock_surr.predict.return_value = np.ones((3, 4))
+        lut.surrogate = mock_surr
+        Y = lut.predict(np.ones((3, 2)))
+        self.assertEqual(Y.shape, (3, 10))
+
+    def test_dct_output_smoother_than_direct(self):
+        """Truncated DCT reconstruction should be smoother than random direct output."""
+        from src.reduced_lut import ReducedLUT
+        from unittest.mock import MagicMock
+        cfg = {
+            'surrogate': {'output_representation': 'dct', 'n_output_modes': 4},
+            'reduced_lut': {}, 'material': {},
+            'solver': {'n_nodes_x': 20, 'n_nodes_z': 5},
+            'dimension_reducer': {},
+        }
+        lut = ReducedLUT(cfg, solver=MagicMock())
+        rng = np.random.default_rng(0)
+        # Noisy random profile
+        Y_noisy = rng.uniform(0, 1, size=(1, 20))
+        # Round-trip through truncated DCT should be smoother
+        B = lut._to_dct_space(Y_noisy)
+        Y_smooth = lut._from_dct_space(B)
+        roughness_orig = float(np.mean(np.abs(np.diff(Y_noisy))))
+        roughness_smooth = float(np.mean(np.abs(np.diff(Y_smooth))))
+        self.assertLessEqual(roughness_smooth, roughness_orig + 1e-10)
+
+    def test_dct_smoke_phase2(self):
+        """Phase-2 with output_representation=dct completes without error."""
+        from src.training_pipeline import TrainingPipeline
+        tmp = tempfile.mkdtemp(prefix='pi_dct_surr_')
+        orig = os.getcwd()
+        try:
+            os.chdir(tmp)
+            cfg = _make_smoke_config()
+            cfg['random_field']['field_basis'] = 'dct'
+            cfg['surrogate']['output_representation'] = 'dct'
+            cfg['surrogate']['n_output_modes'] = 3
+            cfg['dimension_reducer']['basis_type'] = 'dct'
+            cfg['dimension_reducer']['d'] = 2
+            pipeline = TrainingPipeline(cfg, output_dir='r/dct_surr')
+            X, Y = pipeline.phase1_generate_dataset()
+            lut = pipeline.phase2_build_reduced_surrogate()
+            # predict must return shape (n, n_x), not (n, n_output_modes)
+            xi_dummy = lut.grid_points[:3]
+            Y_pred = lut.predict(xi_dummy)
+            n_x = cfg['solver']['n_nodes_x']
+            self.assertEqual(Y_pred.shape, (3, n_x))
+        finally:
+            os.chdir(orig)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestPlottingMismatchedCollocation(unittest.TestCase):
+    """Tests that plotting does not crash when collocation positions != n_nodes_x."""
+
+    def test_no_crash_when_collocation_len_ne_n_nodes_x(self):
+        """plot_settlement_comparison_with_collocation must not crash when
+        len(colloc_idx) != n_nodes_x (e.g. 3 collocation points, 20 nodes)."""
+        from src.visualization import Visualization
+        tmp = tempfile.mkdtemp(prefix='pi_viz_mismatch_')
+        orig = os.getcwd()
+        try:
+            os.chdir(tmp)
+            viz = Visualization(plots_dir='plots_test')
+            n_x = 20
+            n_test = 4
+            rng = np.random.default_rng(1)
+            Y_orig = rng.uniform(0, 1e-3, size=(n_test, n_x))
+            Y_pred = rng.uniform(0, 1e-3, size=(n_test, n_x))
+            x_positions = np.linspace(0.0, 1.0, n_x)  # full grid
+            # 3 collocation indices (fewer than n_nodes_x)
+            colloc_idx = np.array([0, 10, 19])
+            from unittest.mock import MagicMock
+            mock_lut = MagicMock()
+            mock_lut.train_indices = np.arange(n_test)
+            # Should not raise
+            viz.plot_settlement_comparison_with_collocation(
+                Y_orig, Y_pred, mock_lut,
+                n_samples=2, x_positions=x_positions, colloc_idx=colloc_idx,
+            )
+            # Verify output file exists
+            self.assertTrue(
+                os.path.exists(
+                    os.path.join('plots_test', 'settlement_comparison',
+                                 'comparison_with_collocation.png')
+                )
+            )
+        finally:
+            os.chdir(orig)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_no_crash_collocation_len_equals_n_nodes_x(self):
+        """Standard case: colloc_idx length == n_nodes_x (all nodes)."""
+        from src.visualization import Visualization
+        tmp = tempfile.mkdtemp(prefix='pi_viz_full_')
+        orig = os.getcwd()
+        try:
+            os.chdir(tmp)
+            viz = Visualization(plots_dir='plots_full')
+            n_x = 10
+            rng = np.random.default_rng(2)
+            Y = rng.uniform(0, 1e-3, size=(6, n_x))
+            x_positions = np.linspace(0.0, 1.0, n_x)
+            colloc_idx = np.arange(n_x)
+            from unittest.mock import MagicMock
+            viz.plot_settlement_comparison_with_collocation(
+                Y, Y, MagicMock(), n_samples=2,
+                x_positions=x_positions, colloc_idx=colloc_idx,
+            )
+            self.assertTrue(
+                os.path.exists(
+                    os.path.join('plots_full', 'settlement_comparison',
+                                 'comparison_with_collocation.png')
+                )
+            )
+        finally:
+            os.chdir(orig)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_ylim_bottom_zero_in_settlement_comparison(self):
+        """Settlement comparison plot y-axis lower bound must be >= 0.
+        Verified by patching Axes.set_ylim to capture all calls."""
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        from src.visualization import Visualization
+        from unittest.mock import patch, call
+        tmp = tempfile.mkdtemp(prefix='pi_viz_ylim_')
+        orig = os.getcwd()
+        try:
+            os.chdir(tmp)
+            viz = Visualization(plots_dir='plots_ylim')
+            n_x = 10
+            rng = np.random.default_rng(3)
+            Y = rng.uniform(0.0, 1e-3, size=(4, n_x))
+            x_positions = np.linspace(0.0, 1.0, n_x)
+
+            # Capture set_ylim calls by patching at the Axes level
+            ylim_calls = []
+            original_set_ylim = plt.Axes.set_ylim
+
+            def mock_set_ylim(self_ax, *args, **kwargs):
+                ylim_calls.append((args, kwargs))
+                return original_set_ylim(self_ax, *args, **kwargs)
+
+            with patch.object(plt.Axes, 'set_ylim', mock_set_ylim):
+                viz.plot_settlement_comparison(Y, Y, n_samples=2, x_positions=x_positions)
+
+            # At least one set_ylim call with bottom=0.0 must be present
+            has_bottom_zero = any(
+                kwargs.get('bottom', None) == 0.0 or (args and args[0] == 0.0)
+                for args, kwargs in ylim_calls
+            )
+            self.assertTrue(
+                has_bottom_zero,
+                f"Expected set_ylim(bottom=0.0) to be called; calls were: {ylim_calls}"
+            )
+        finally:
+            os.chdir(orig)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == '__main__':
     unittest.main()

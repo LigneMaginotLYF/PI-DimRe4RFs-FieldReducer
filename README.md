@@ -15,6 +15,30 @@ This repository implements a dimension-reduction surrogate modeling framework fo
 
 ---
 
+## Key Features
+
+### Phase 1 – Fixed DCT basis with Matérn-shaped sampling and DC-encoded mean
+
+When `random_field.field_basis: "dct"`, Phase 1 uses a **fixed 2D DCT-II basis** for log(E).  The coefficient vector ξ_E has consistent semantics across all samples because the basis never changes.  Matérn-like spatial structure is achieved by shaping the *variance* of each DCT coefficient using an approximate 2D Matérn spectral density (controlled by `nu_sampling`/`length_scale_sampling`).
+
+**Per-sample mean variation** (`E_ref_sampling: true`, DCT only): each sample draws a scaling factor `f ~ Uniform(E_ref_factor_range)` and encodes the mean shift directly into the DC DCT coefficient (index 0, mode (0,0)).  This means the ξ_E vector alone carries the mean information—no extra input feature is required.
+
+### Phase 2 – Smooth DCT surrogate output
+
+Set `surrogate.output_representation: "dct"` (and `n_output_modes: 8`) to train the Phase-2 surrogate to predict **DCT coefficients** of the settlement profile Y(x) rather than raw node values.  At inference, `ReducedLUT.predict()` applies the inverse DCT to return the full profile.  The truncated DCT basis constrains predictions to smooth (band-limited) functions, preventing the oscillatory artefacts that can appear with direct node-by-node prediction.
+
+A **roughness diagnostic** (mean ‖ΔY‖) is logged at Phase-2 evaluation alongside R² and RMSE to make any remaining oscillations visible.
+
+### Phase 4 – Direct-physics qualitative plots
+
+When `phase4.use_direct_physics_for_plots: true` (default), the 5-sample settlement comparison plots use the **direct Biot solver** on the reconstructed reduced E field rather than the Phase-2 surrogate.  This isolates dimension-reducer + reduced-field error in the plots, removing Phase-2 surrogate artefacts from the visual comparison.  Quantitative metrics (R², RMSE, etc.) still use the surrogate for speed.
+
+### Plot improvements
+
+Settlement comparison plot y-axes always have `ylim(bottom=0.0)` for absolute-scale context.  The x-axis uses the full solver grid (`n_nodes_x` points); collocation positions are overlaid as markers only.
+
+---
+
 ## Environment Setup
 
 ```bash
@@ -102,11 +126,14 @@ Tests cover:
 - Scientific notation coercion
 - Matérn kernel positive semi-definiteness
 - KL field generation (positive E values, no NaN)
+- DCT field generation: fixed basis, mean encoding via DC coefficient, E_ref_sampling
+- Phase-2 DCT surrogate output: correct reconstruction shape, smoother-than-direct output
 - Biot solver output shape and physical consistency
 - NN and PCE surrogate fit/predict
 - Validation metric computation
 - Full pipeline smoke run (PCE and NN)
 - Phase 2 surrogate reuse/cache
+- Settlement comparison plotting: correct y-axis lower bound, no crash when collocation length ≠ n_nodes_x
 
 ---
 

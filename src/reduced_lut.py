@@ -26,24 +26,28 @@ class ReducedLUT:
         self.output_dir = output_dir or 'models/reduced_lut'
         os.makedirs(self.output_dir, exist_ok=True)
 
-        lut_cfg = config.get('reduced_lut', {})
+        lut_cfg = config.get('reduced_lut') or {}
         self.n_grid_points = lut_cfg.get('n_grid_points', 2000)
         self.grid_type = lut_cfg.get('grid_type', 'random')
 
-        mat_cfg = config.get('material', {})
+        mat_cfg = config.get('material') or {}
         self.E_ref = mat_cfg.get('E_ref', 10.0e6)
         self.k_ref = mat_cfg.get('permeability_ref', 1.0e-12)
         self.k_h = mat_cfg.get('permeability_h', 1.0e-12)
         self.k_v = mat_cfg.get('permeability_v', 1.0e-12)
 
-        sol_cfg = config.get('solver', {})
+        sol_cfg = config.get('solver') or {}
         self.n_x = sol_cfg.get('n_nodes_x', 20)
         self.n_z = sol_cfg.get('n_nodes_z', 20)
 
-        red_cfg = config.get('dimension_reducer', {})
+        red_cfg = config.get('dimension_reducer') or {}
         self.d = red_cfg.get('d', 1)
         self.basis_type = red_cfg.get('basis_type', 'polynomial')
         self.basis_order = red_cfg.get('basis_order', 1)
+
+        surr_cfg = config.get('surrogate') or {}
+        self.output_representation = surr_cfg.get('output_representation', 'direct')
+        self.n_output_modes = surr_cfg.get('n_output_modes', 8)
 
         self.config_hash = self._compute_config_hash()
 
@@ -60,14 +64,15 @@ class ReducedLUT:
         - reduced space: d, basis_type, basis_order
         - solver: type (1d/2d), response_mode, n_nodes_x, n_nodes_z
         - KL reference params (nu_ref, ls_ref) when basis_type='kl'
+        - surrogate output representation and n_output_modes
 
         Changes to any of these require recomputing the LUT.
         Physical constants (E_ref, permeability values) are intentionally excluded
         because they affect only the magnitude of the surrogate output, not its
         dimensionality or basis structure.
         """
-        sol_cfg = self.config.get('solver', {})
-        rf_cfg = self.config.get('random_field', {})
+        sol_cfg = self.config.get('solver') or {}
+        rf_cfg = self.config.get('random_field') or {}
         parts = [
             f"d={self.d}",
             f"basis_type={self.basis_type}",
@@ -76,6 +81,8 @@ class ReducedLUT:
             f"response_mode={sol_cfg.get('response_mode', 'steady_state')}",
             f"n_nodes_x={self.n_x}",
             f"n_nodes_z={self.n_z}",
+            f"output_representation={self.output_representation}",
+            f"n_output_modes={self.n_output_modes}",
         ]
         if self.basis_type == 'kl':
             parts += [
@@ -207,6 +214,33 @@ class ReducedLUT:
         fg = DCTField(self.n_x, self.n_z, length_x, length_z)
         return fg.reconstruct_from_coefficients(xi_prime, E_ref=self.E_ref, logE_std=logE_std)
 
+    def _to_dct_space(self, Y):
+        """Transform settlement profiles to DCT coefficient space.
+
+        Args:
+            Y: shape (n, n_x) - full settlement profiles
+        Returns:
+            B: shape (n, n_output_modes) - first n_output_modes DCT-II coefficients
+        """
+        from scipy.fft import dct
+        B = dct(Y, type=2, norm='ortho', axis=1)
+        return B[:, :self.n_output_modes]
+
+    def _from_dct_space(self, b):
+        """Reconstruct settlement profiles from DCT coefficients.
+
+        Args:
+            b: shape (n, n_output_modes) - DCT-II coefficients
+        Returns:
+            Y: shape (n, n_x) - reconstructed full settlement profiles
+        """
+        from scipy.fft import idct
+        n = b.shape[0]
+        B_padded = np.zeros((n, self.n_x))
+        modes = min(self.n_output_modes, self.n_x)
+        B_padded[:, :modes] = b[:, :modes]
+        return idct(B_padded, type=2, norm='ortho', axis=1)
+
     def _reconstruct_field(self, xi_prime):
         """
         Reconstruct material E field from d-dimensional reduced coefficients.
@@ -274,7 +308,19 @@ class ReducedLUT:
         X_val = self.grid_points[val_idx]
         Y_val = self.responses[val_idx]
 
-        output_dim = Y_train.shape[1]
+        # Apply DCT output transform when output_representation='dct'
+        if self.output_representation == 'dct':
+            Y_train_fit = self._to_dct_space(Y_train)
+            Y_val_fit = self._to_dct_space(Y_val)
+            output_dim = min(self.n_output_modes, Y_train.shape[1])
+            logger.info(
+                f"Surrogate output: DCT basis with {output_dim} modes "
+                f"(n_x={self.n_x})"
+            )
+        else:
+            Y_train_fit = Y_train
+            Y_val_fit = Y_val
+            output_dim = Y_train.shape[1]
 
         if surrogate_type == 'nn':
             hidden_dim = surrogate_cfg.get('hidden_dim', 64)
@@ -287,7 +333,7 @@ class ReducedLUT:
                 input_dim=self.d, output_dim=output_dim,
                 hidden_dim=hidden_dim, n_blocks=n_blocks
             )
-            model.fit(X_train, Y_train, X_val, Y_val,
+            model.fit(X_train, Y_train_fit, X_val, Y_val_fit,
                       epochs=epochs, lr=lr, batch_size=batch_size)
             self.surrogate = model
 
@@ -296,13 +342,25 @@ class ReducedLUT:
             model = PolynomialChaosExpansion(
                 degree=degree, n_inputs=self.d, n_outputs=output_dim
             )
-            model.fit(X_train, Y_train)
+            model.fit(X_train, Y_train_fit)
             self.surrogate = model
 
-        Y_pred = self.surrogate.predict(X_val)
+        # Evaluate in full spatial domain (after inverse DCT if needed)
+        Y_pred_val = self.predict(X_val)
         from sklearn.metrics import r2_score
-        r2 = r2_score(Y_val, Y_pred)
+        r2 = r2_score(Y_val, Y_pred_val)
         logger.info(f"Reduced surrogate validation R² = {r2:.4f}")
+
+        # Roughness diagnostics: mean L2 norm of first differences
+        roughness_gt = float(np.mean(
+            np.sqrt(np.mean(np.diff(Y_val, axis=1) ** 2, axis=1))
+        ))
+        roughness_pred = float(np.mean(
+            np.sqrt(np.mean(np.diff(Y_pred_val, axis=1) ** 2, axis=1))
+        ))
+        logger.info(
+            f"Roughness ||ΔY||: GT={roughness_gt:.4e}, pred={roughness_pred:.4e}"
+        )
         return r2
 
     def save(self, surrogate_type='nn', r2_val=None):
@@ -335,6 +393,8 @@ class ReducedLUT:
             'd': self.d,
             'basis_type': self.basis_type,
             'basis_order': self.basis_order,
+            'output_representation': self.output_representation,
+            'n_output_modes': self.n_output_modes,
         }
         with open(os.path.join(self.output_dir, 'config.json'), 'w', encoding='utf-8') as f:
             json.dump(cfg, f, indent=2)
@@ -363,7 +423,11 @@ class ReducedLUT:
         if surrogate_type == 'nn':
             full_model_path = os.path.join(self.output_dir, 'surrogate_nn_full.pt')
             if os.path.exists(full_model_path):
-                self.surrogate = torch.load(full_model_path, weights_only=False)
+                try:
+                    self.surrogate = torch.load(full_model_path, weights_only=False)
+                except TypeError:
+                    # Torch < 1.13 does not accept weights_only kwarg
+                    self.surrogate = torch.load(full_model_path)
             else:
                 with open(cfg_path, 'r', encoding='utf-8') as f:
                     meta = json.load(f)
@@ -372,13 +436,30 @@ class ReducedLUT:
                     input_dim=meta['input_dim'],
                     output_dim=meta['output_dim']
                 )
-                model.load_state_dict(torch.load(
-                    os.path.join(self.output_dir, 'surrogate_nn.pt')
-                ))
+                try:
+                    model.load_state_dict(torch.load(
+                        os.path.join(self.output_dir, 'surrogate_nn.pt'),
+                        weights_only=True,
+                    ))
+                except TypeError:
+                    model.load_state_dict(torch.load(
+                        os.path.join(self.output_dir, 'surrogate_nn.pt')
+                    ))
                 self.surrogate = model
         else:
             with open(os.path.join(self.output_dir, 'surrogate_pce.pkl'), 'rb') as f:
                 self.surrogate = pickle.load(f)
+
+        # Restore output representation settings from saved config if present
+        if os.path.exists(cfg_path):
+            with open(cfg_path, 'r', encoding='utf-8') as f:
+                meta = json.load(f)
+            saved_repr = meta.get('output_representation')
+            if saved_repr is not None:
+                self.output_representation = saved_repr
+            saved_modes = meta.get('n_output_modes')
+            if saved_modes is not None:
+                self.n_output_modes = int(saved_modes)
 
         logger.info(f"Loaded LUT surrogate from {self.output_dir}")
 
@@ -394,6 +475,11 @@ class ReducedLUT:
     def predict(self, xi_prime):
         """
         Predict settlement profiles for given reduced parameters.
+
+        When ``output_representation='dct'``, the surrogate predicts DCT
+        coefficients which are then reconstructed to full spatial profiles via
+        inverse DCT.
+
         Args:
             xi_prime: shape (n, d) or (d,)
         Returns:
@@ -404,5 +490,9 @@ class ReducedLUT:
         scalar = xi_prime.ndim == 1
         if scalar:
             xi_prime = xi_prime.reshape(1, -1)
-        Y = self.surrogate.predict(xi_prime)
+        Y_raw = self.surrogate.predict(xi_prime)
+        if self.output_representation == 'dct':
+            Y = self._from_dct_space(Y_raw)
+        else:
+            Y = Y_raw
         return Y[0] if scalar else Y
