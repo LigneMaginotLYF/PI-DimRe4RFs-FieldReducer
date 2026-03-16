@@ -100,7 +100,7 @@ When `field_basis: "dct"`:
   produce the *same* log-field regardless of which (ν, ℓ) was used to draw them.
 - Matérn-like spatial structure is achieved by sampling each coefficient
   `a_k ~ N(0, σ_k²)` where `σ_k ∝ (2ν/ℓ² + ‖ω_k‖²)^{-(ν+1)/2}` (approximate
-  2D Matérn spectral density; documented in `src/field_generator.py::DCTField`).
+  2D Matérn spectral density; documented in `src/field_generator.py` (`DCTField` class)).
 - The coefficient vector stored in `X_train` includes the Matérn-shaped variance,
   so the mapping M: ξ_E → ξ' is trained on these scaled coefficients.
 - Set `dimension_reducer.basis_type: "dct"` in Phase 2 to use the same DCT

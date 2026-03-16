@@ -92,9 +92,11 @@ class DCTField:
         var(a_k) ∝ (2·ν/ℓ² + ‖ω_k‖²)^{-(ν+1)}
 
     where ω_k = (m·π/L_x, n·π/L_z) is the angular frequency of mode k.
-    This is an approximation to the exact Matérn spectral density in 2D
-    (which has exponent -(ν+1) for 2D, i.e. spectral density ∝ (α²+ω²)^{-(ν+d/2)}
-    with d=2).  The formula is documented here so users can audit or replace it.
+    This is an approximation to the exact Matérn spectral density in 2D.
+    The general Matérn spectral density in d-dimensional space is
+    ∝ (2ν/ℓ² + ‖ω‖²)^{-(ν+d/2)}.  For d=2 this becomes -(ν+d/2) = -(ν+1),
+    which is the exponent used here.  The formula is documented so users can
+    audit or replace it.
 
     The field is:
         logE(x,z) = logE_std · sum_k a_k · psi_k(x,z)
@@ -213,6 +215,8 @@ class DCTField:
             Standard deviation for each coefficient a_k.
         """
         alpha2 = 2.0 * nu / (length_scale ** 2)
+        # Approximate 2D Matérn spectral density: (2ν/ℓ² + ‖ω‖²)^{-(ν+d/2)} with d=2
+        # → exponent = -(ν + 1).
         S = (alpha2 + mode_freqs ** 2) ** (-(nu + 1.0))
         S = np.maximum(S, 1e-30)
         # Normalise so that sum(sigma_k^2) = 1 (unit total variance before logE_std)

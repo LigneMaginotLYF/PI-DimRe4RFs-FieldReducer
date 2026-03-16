@@ -224,7 +224,9 @@ class ReducedLUT:
             return self._reconstruct_field_dct(xi_prime)
         else:
             raise ValueError(
-                f"Unknown basis_type: {self.basis_type!r}. Use 'polynomial', 'kl', or 'dct'."
+                f"Unknown basis_type: {self.basis_type!r}. "
+                "Set dimension_reducer.basis_type in config.yaml to one of: "
+                "'polynomial', 'kl', or 'dct'."
             )
 
     def precompute_responses(self, field_generator=None):
