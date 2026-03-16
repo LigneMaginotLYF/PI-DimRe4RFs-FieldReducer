@@ -116,27 +116,45 @@ class TrainingPipeline:
         return 5  # default
 
     @staticmethod
-    def _compute_collocation_indices(config, n_nodes_x, length_x):
+    def _compute_collocation_indices(config, n_nodes_x, length_x, phase=None):
         """
         Compute collocation node indices from config.
 
         Uses ``collocation.positions`` (physical x-coordinates) when provided;
         otherwise defaults to all n_nodes_x nodes.
 
-        The same indices are used for:
-          - Phase-3 training loss (compare Y at colloc_idx only)
-          - Phase-4 plot markers (green circles on settlement curves)
+        Phase-specific overrides are supported for independent configuration of
+        Phase-2 evaluation markers and Phase-3 training loss:
+
+          - ``phase='phase2'``: reads ``collocation_phase2.positions`` first;
+            falls back to ``collocation.positions``, then to all nodes.
+          - ``phase='phase3'``: reads ``collocation_phase3.positions`` first;
+            falls back to ``collocation.positions``, then to all nodes.
+          - ``phase=None``: reads ``collocation.positions`` only.
 
         Args:
             config      : Full pipeline config dict.
             n_nodes_x   : Number of x-nodes in the solver grid.
             length_x    : Physical length of the domain in x.
+            phase       : Optional 'phase2' | 'phase3' to use phase-specific
+                          config sections with fallback.
 
         Returns:
             colloc_idx  : 1-D numpy int array of node indices, sorted ascending.
         """
-        collocation_cfg = config.get('collocation') or {}
-        positions_cfg = collocation_cfg.get('positions', None)
+        positions_cfg = None
+        if phase == 'phase2':
+            phase_cfg = config.get('collocation_phase2') or {}
+            positions_cfg = phase_cfg.get('positions', None)
+        elif phase == 'phase3':
+            phase_cfg = config.get('collocation_phase3') or {}
+            positions_cfg = phase_cfg.get('positions', None)
+
+        # Fallback to common collocation section when phase-specific is absent
+        if positions_cfg is None:
+            collocation_cfg = config.get('collocation') or {}
+            positions_cfg = collocation_cfg.get('positions', None)
+
         if positions_cfg is not None:
             positions = np.asarray(positions_cfg, dtype=float)
             # Map each physical position to the nearest node index.
@@ -151,14 +169,17 @@ class TrainingPipeline:
             use_left = np.abs(x_grid[left] - positions) <= np.abs(x_grid[raw] - positions)
             indices = np.where(use_left, left, raw).astype(int)
             colloc_idx = np.unique(indices)  # sorted, deduplicated
+            phase_label = f" (phase={phase})" if phase else ""
             logger.info(
-                f"Collocation: using {len(colloc_idx)} node indices "
+                f"Collocation{phase_label}: using {len(colloc_idx)} node indices "
                 f"from {len(positions)} configured positions: {colloc_idx.tolist()}"
             )
         else:
             colloc_idx = np.arange(n_nodes_x, dtype=int)
+            phase_label = f" (phase={phase})" if phase else ""
             logger.info(
-                f"Collocation: no positions configured – using all {n_nodes_x} nodes"
+                f"Collocation{phase_label}: no positions configured – "
+                f"using all {n_nodes_x} nodes"
             )
         return colloc_idx
 
@@ -422,7 +443,8 @@ class TrainingPipeline:
         # Compute collocation indices – single source of truth for Phase-3 + Phase-4
         n_nodes_x = sol_cfg.get('n_nodes_x', 20)
         length_x = dom_cfg.get('length_x', 1.0)
-        colloc_idx = self._compute_collocation_indices(self.config, n_nodes_x, length_x)
+        colloc_idx = self._compute_collocation_indices(self.config, n_nodes_x, length_x,
+                                                       phase='phase3')
         lut_output_dir = os.path.join(self.models_dir, 'reduced_lut')
         os.makedirs(lut_output_dir, exist_ok=True)
         np.save(os.path.join(lut_output_dir, 'collocation_indices.npy'), colloc_idx)
@@ -531,6 +553,9 @@ class TrainingPipeline:
                 lr=surr_cfg.get('learning_rate', 1e-3),
                 batch_size=surr_cfg.get('batch_size', 64),
                 colloc_idx=colloc_idx,
+                output_representation=reduced_lut.output_representation,
+                n_output_modes=reduced_lut.n_output_modes,
+                n_nodes_x=reduced_lut.n_x,
             )
         else:
             from src.mapping_learner_pce import PolynomialChaosExpansion
@@ -542,7 +567,10 @@ class TrainingPipeline:
                 n_outputs=output_dim,
             )
             reducer.fit_with_surrogate(X_tr, Y_tr, reduced_lut.surrogate,
-                                       colloc_idx=colloc_idx)
+                                       colloc_idx=colloc_idx,
+                                       output_representation=reduced_lut.output_representation,
+                                       n_output_modes=reduced_lut.n_output_modes,
+                                       n_nodes_x=reduced_lut.n_x)
         return reducer
 
     def phase4_evaluate(self, reducer, reduced_lut, X_test, Y_test):
@@ -613,37 +641,45 @@ class TrainingPipeline:
             colloc_idx = np.load(colloc_idx_path)
         else:
             colloc_idx = self._compute_collocation_indices(
-                self.config, n_x, length_x
+                self.config, n_x, length_x, phase='phase3'
             )
 
-        # --- Settlement comparison plots (direct physics by default) ---
+        # --- Settlement comparison plots ---
+        # Pre-select a fixed set of plot samples so that both the plain comparison
+        # and the collocation-overlay comparison are generated from EXACTLY the
+        # same samples and the same forward path (direct physics or surrogate).
         p4_cfg = self.config.get('phase4') or {}
         use_direct_physics = p4_cfg.get('use_direct_physics_for_plots', True)
         n_plot = min(5, len(X_test))
         rng_plot = np.random.default_rng(42)
         plot_indices = rng_plot.choice(len(X_test), size=n_plot, replace=False)
 
+        Y_plot_true = Y_test[plot_indices]
         if use_direct_physics:
-            Y_plot_pred = self._compute_direct_physics_predictions(
+            Y_direct = self._compute_direct_physics_predictions(
                 xi_prime_pred[plot_indices], reduced_lut
             )
-            Y_plot_true = Y_test[plot_indices]
-            if Y_plot_pred is not None:
+            if Y_direct is not None:
+                Y_plot_pred = Y_direct
                 logger.info(
                     "Phase 4: settlement comparison plots use direct Biot solver "
                     "(phase4.use_direct_physics_for_plots=true)"
                 )
-                viz.plot_settlement_comparison(
-                    Y_plot_true, Y_plot_pred, n_samples=n_plot,
-                    x_positions=x_positions,
-                )
             else:
-                # Fallback if direct physics fails
-                viz.plot_settlement_comparison(Y_test, Y_pred, n_samples=5,
-                                               x_positions=x_positions)
+                # Fallback: surrogate predictions for the selected samples
+                Y_plot_pred = Y_pred[plot_indices]
+                logger.warning(
+                    "Phase 4: direct-physics predictions failed; "
+                    "falling back to surrogate predictions for plots."
+                )
         else:
-            viz.plot_settlement_comparison(Y_test, Y_pred, n_samples=5,
-                                           x_positions=x_positions)
+            Y_plot_pred = Y_pred[plot_indices]
+
+        # Both plots use the same pre-selected samples and the same predictions
+        viz.plot_settlement_comparison(
+            Y_plot_true, Y_plot_pred, n_samples=n_plot,
+            x_positions=x_positions,
+        )
 
         viz.plot_aggregate_metrics(Y_test, Y_pred)
         viz.plot_sobol_sensitivity(primary_reducer, input_dim=X_test.shape[1])
@@ -651,7 +687,7 @@ class TrainingPipeline:
         # Collocation point visualizations (when LUT has training indices)
         if reduced_lut.train_indices is not None:
             viz.plot_settlement_comparison_with_collocation(
-                Y_test, Y_pred, reduced_lut, n_samples=5,
+                Y_plot_true, Y_plot_pred, reduced_lut, n_samples=n_plot,
                 x_positions=x_positions,
                 colloc_idx=colloc_idx,
             )

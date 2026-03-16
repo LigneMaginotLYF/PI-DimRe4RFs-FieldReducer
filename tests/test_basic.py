@@ -1525,5 +1525,203 @@ class TestPlottingMismatchedCollocation(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+
+
+class TestDCTOutputPhase3NoCrash(unittest.TestCase):
+    """Phase-3 training with DCT surrogate output must not crash (CUDA index OOB fix)."""
+
+    def test_dct_output_phase3_no_crash_all_nodes(self):
+        """Phase-3 with output_representation='dct', n_output_modes < n_nodes_x,
+        and default all-node collocation must not raise CUDA/CPU index out of bounds."""
+        from src.training_pipeline import TrainingPipeline
+        tmp = tempfile.mkdtemp(prefix='pi_dct_phase3_')
+        orig = os.getcwd()
+        try:
+            os.chdir(tmp)
+            cfg = _make_smoke_config()
+            # DCT surrogate with fewer modes than spatial nodes: this is the scenario
+            # that previously caused "index out of bounds" on the GPU.
+            cfg['solver']['n_nodes_x'] = 10
+            cfg['surrogate']['output_representation'] = 'dct'
+            cfg['surrogate']['n_output_modes'] = 3   # K=3 < n_nodes_x=10
+            cfg['random_field']['field_basis'] = 'dct'
+            cfg['dimension_reducer']['basis_type'] = 'dct'
+            cfg['dimension_reducer']['d'] = 2
+            # No positions → default all-node collocation (colloc_idx has 10 entries,
+            # but surrogate only produces 3 DCT modes → previously caused OOB)
+            cfg['collocation'] = {}
+
+            pipeline = TrainingPipeline(cfg, output_dir='r/dct_p3')
+            X, Y = pipeline.phase1_generate_dataset()
+            lut = pipeline.phase2_build_reduced_surrogate()
+            # This call must NOT crash
+            reducer, (X_test, Y_test) = pipeline.phase3_train_dimension_reducer(X, Y, lut)
+            # Verify predictions have correct node-space shape
+            xi_prime = reducer.predict(X_test)
+            Y_pred = lut.predict(xi_prime)
+            self.assertEqual(Y_pred.shape[1], cfg['solver']['n_nodes_x'])
+        finally:
+            os.chdir(orig)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_dct_output_phase3_no_crash_partial_collocation(self):
+        """Phase-3 with DCT output and a small collocation subset must not crash."""
+        from src.training_pipeline import TrainingPipeline
+        tmp = tempfile.mkdtemp(prefix='pi_dct_p3_partial_')
+        orig = os.getcwd()
+        try:
+            os.chdir(tmp)
+            cfg = _make_smoke_config()
+            cfg['solver']['n_nodes_x'] = 10
+            cfg['surrogate']['output_representation'] = 'dct'
+            cfg['surrogate']['n_output_modes'] = 4   # K=4 < n_nodes_x=10
+            cfg['random_field']['field_basis'] = 'dct'
+            cfg['dimension_reducer']['basis_type'] = 'dct'
+            cfg['dimension_reducer']['d'] = 2
+            # Partial phase3 collocation: only 3 of 10 positions
+            cfg['collocation_phase3'] = {'positions': [0.0, 0.5, 1.0]}
+
+            pipeline = TrainingPipeline(cfg, output_dir='r/dct_p3_partial')
+            X, Y = pipeline.phase1_generate_dataset()
+            lut = pipeline.phase2_build_reduced_surrogate()
+            reducer, (X_test, Y_test) = pipeline.phase3_train_dimension_reducer(X, Y, lut)
+            Y_pred = lut.predict(reducer.predict(X_test))
+            self.assertEqual(Y_pred.shape[1], cfg['solver']['n_nodes_x'])
+        finally:
+            os.chdir(orig)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_dct_idct_projection_is_differentiable(self):
+        """The inverse-DCT projection used in fit_with_surrogate must be a valid
+        torch linear op: y_nodes = y_dct @ dct_proj gives shape (B, N)."""
+        import torch
+        from src.dct_utils import build_idct_basis
+
+        K, N = 3, 10
+        D = build_idct_basis(n_modes=K, n_nodes=N)  # (N, K)
+        dct_proj = torch.tensor(D.T, dtype=torch.float32)  # (K, N)
+
+        B = 5
+        y_dct = torch.randn(B, K, requires_grad=True)
+        y_nodes = torch.matmul(y_dct, dct_proj)
+        self.assertEqual(y_nodes.shape, (B, N))
+        # Should be differentiable (backward must not raise)
+        y_nodes.sum().backward()
+        self.assertIsNotNone(y_dct.grad)
+
+
+class TestSeparateCollocationConfigs(unittest.TestCase):
+    """Separate collocation_phase2 / collocation_phase3 config sections."""
+
+    def test_phase3_collocation_overrides_common(self):
+        """collocation_phase3.positions takes precedence over collocation.positions."""
+        from src.training_pipeline import TrainingPipeline
+        cfg = {
+            'collocation': {'positions': [0.0, 0.25, 0.5, 0.75, 1.0]},
+            'collocation_phase3': {'positions': [0.0, 1.0]},
+        }
+        idx = TrainingPipeline._compute_collocation_indices(
+            cfg, n_nodes_x=20, length_x=1.0, phase='phase3'
+        )
+        # 2 positions → 2 unique node indices
+        self.assertEqual(len(idx), 2)
+
+    def test_phase2_collocation_overrides_common(self):
+        """collocation_phase2.positions takes precedence over collocation.positions."""
+        from src.training_pipeline import TrainingPipeline
+        cfg = {
+            'collocation': {'positions': [0.0, 0.5, 1.0]},
+            'collocation_phase2': {'positions': [0.0, 0.25, 0.5, 0.75, 1.0]},
+        }
+        idx = TrainingPipeline._compute_collocation_indices(
+            cfg, n_nodes_x=20, length_x=1.0, phase='phase2'
+        )
+        self.assertEqual(len(idx), 5)
+
+    def test_phase3_falls_back_to_common_when_absent(self):
+        """When collocation_phase3 is absent, fall back to collocation.positions."""
+        from src.training_pipeline import TrainingPipeline
+        cfg = {
+            'collocation': {'positions': [0.0, 0.5, 1.0]},
+        }
+        idx = TrainingPipeline._compute_collocation_indices(
+            cfg, n_nodes_x=20, length_x=1.0, phase='phase3'
+        )
+        self.assertEqual(len(idx), 3)
+
+    def test_phase_none_uses_common(self):
+        """phase=None always reads from collocation section."""
+        from src.training_pipeline import TrainingPipeline
+        cfg = {
+            'collocation': {'positions': [0.0, 0.5, 1.0]},
+            'collocation_phase3': {'positions': [0.0, 1.0]},
+        }
+        # phase=None should NOT use collocation_phase3
+        idx = TrainingPipeline._compute_collocation_indices(
+            cfg, n_nodes_x=20, length_x=1.0, phase=None
+        )
+        self.assertEqual(len(idx), 3)
+
+    def test_separate_collocation_pipeline_no_crash(self):
+        """Full pipeline with separate phase3 collocation (fewer positions) must not crash."""
+        from src.training_pipeline import TrainingPipeline
+        tmp = tempfile.mkdtemp(prefix='pi_sep_colloc_')
+        orig = os.getcwd()
+        try:
+            os.chdir(tmp)
+            cfg = _make_smoke_config()
+            cfg['solver']['n_nodes_x'] = 10
+            # Common collocation: 5 positions
+            cfg['collocation'] = {'positions': [0.0, 0.25, 0.5, 0.75, 1.0]}
+            # Phase-3 uses only 2 positions
+            cfg['collocation_phase3'] = {'positions': [0.0, 1.0]}
+
+            pipeline = TrainingPipeline(cfg, output_dir='r/sep_colloc')
+            X, Y = pipeline.phase1_generate_dataset()
+            lut = pipeline.phase2_build_reduced_surrogate()
+            reducer, (X_test, Y_test) = pipeline.phase3_train_dimension_reducer(X, Y, lut)
+
+            # The saved collocation_indices.npy must reflect phase3 config (2 positions)
+            colloc_saved = np.load('models/reduced_lut/collocation_indices.npy')
+            self.assertEqual(len(colloc_saved), 2)
+        finally:
+            os.chdir(orig)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestPhase4PlottingConsistency(unittest.TestCase):
+    """Both comparison.png and comparison_with_collocation.png must use the same samples."""
+
+    def test_both_plots_use_same_samples_and_predictions(self):
+        """Verify that phase4_evaluate calls both plot functions with
+        pre-selected samples (same Y_plot_true / Y_plot_pred) by checking that
+        both output files are created and that the pipeline runs without error."""
+        from src.training_pipeline import TrainingPipeline
+        tmp = tempfile.mkdtemp(prefix='pi_p4_plots_')
+        orig = os.getcwd()
+        try:
+            os.chdir(tmp)
+            cfg = _make_smoke_config()
+            # Disable direct-physics for speed (avoids extra solver calls in test)
+            cfg['phase4'] = {'use_direct_physics_for_plots': False}
+
+            pipeline = TrainingPipeline(cfg, output_dir='r/p4_plots')
+            X, Y = pipeline.phase1_generate_dataset()
+            lut = pipeline.phase2_build_reduced_surrogate()
+            reducer, (X_test, Y_test) = pipeline.phase3_train_dimension_reducer(X, Y, lut)
+            pipeline.phase4_evaluate(reducer, lut, X_test, Y_test)
+
+            plots_dir = 'r/p4_plots/plots/settlement_comparison'
+            self.assertTrue(os.path.exists(os.path.join(plots_dir, 'comparison.png')),
+                            "comparison.png must be created")
+            self.assertTrue(
+                os.path.exists(os.path.join(plots_dir, 'comparison_with_collocation.png')),
+                "comparison_with_collocation.png must be created",
+            )
+        finally:
+            os.chdir(orig)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == '__main__':
     unittest.main()
