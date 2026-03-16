@@ -1200,8 +1200,9 @@ class TestCollocationConsistency(unittest.TestCase):
 
             # Indices must correspond to 3 positions (0.0→0, 0.5→10, 1.0→19)
             x_grid = np.linspace(0.0, 1.0, 20)
+            dx = 1.0 / (20 - 1)  # grid spacing for n_nodes_x=20
             for pos, idx in zip([0.0, 0.5, 1.0], np.sort(colloc_idx_saved)):
-                self.assertAlmostEqual(x_grid[idx], pos, delta=1.0 / 19 + 1e-9)
+                self.assertAlmostEqual(x_grid[idx], pos, delta=dx + 1e-9)
         finally:
             os.chdir(orig)
             shutil.rmtree(tmp, ignore_errors=True)

@@ -104,6 +104,9 @@ class PolynomialChaosExpansion:
                 return np.sum((y_pred - y_ref) ** 2)
 
             def grad(xi_p):
+                # Finite-difference gradient of obj.  Because obj already
+                # filters outputs through colloc_idx, this gradient is
+                # correctly restricted to the collocation subset.
                 eps = 1e-5
                 g = np.zeros_like(xi_p)
                 f0 = obj(xi_p)

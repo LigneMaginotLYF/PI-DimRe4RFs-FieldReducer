@@ -139,12 +139,17 @@ class TrainingPipeline:
         positions_cfg = collocation_cfg.get('positions', None)
         if positions_cfg is not None:
             positions = np.asarray(positions_cfg, dtype=float)
-            # Map each physical position to the nearest node index
+            # Map each physical position to the nearest node index.
+            # The grid is uniform so searchsorted gives an O(log n) candidate,
+            # but we still clamp and compare both neighbours for correctness.
             x_grid = np.linspace(0.0, length_x, n_nodes_x)
-            indices = np.array(
-                [int(np.argmin(np.abs(x_grid - p))) for p in positions],
-                dtype=int,
-            )
+            dx = length_x / max(n_nodes_x - 1, 1)
+            raw = np.searchsorted(x_grid, positions)
+            raw = np.clip(raw, 0, n_nodes_x - 1)
+            # Prefer left neighbour when equidistant or closer
+            left = np.clip(raw - 1, 0, n_nodes_x - 1)
+            use_left = np.abs(x_grid[left] - positions) <= np.abs(x_grid[raw] - positions)
+            indices = np.where(use_left, left, raw).astype(int)
             colloc_idx = np.unique(indices)  # sorted, deduplicated
             logger.info(
                 f"Collocation: using {len(colloc_idx)} node indices "
