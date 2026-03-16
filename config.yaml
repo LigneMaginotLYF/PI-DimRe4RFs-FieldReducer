@@ -26,22 +26,79 @@ domain:
   length_z: 1.0
 
 solver:
+  # Problem dimensionality.
+  # Allowed values: "2d" | "1d"
+  # 1d: single vertical column; n_nodes_x must be set to 1.
+  # 2d: full 2-D plane-strain domain (default).
   type: "2d"
+
+  # Physical regime.
+  # Allowed values: "steady_state" | "transient"
+  # steady_state: Darcy steady-state flow; analytical pressure profile (default).
+  # transient   : Terzaghi-Biot time-dependent consolidation; requires t_final.
   response_mode: "steady_state"
+
+  # Number of finite-difference nodes in x and z directions.
+  # For 1-D problems use n_nodes_x: 1.
   n_nodes_x: 20
   n_nodes_z: 20
 
+  # Non-dimensional final time for transient simulations.
+  # T = c_v · t / L_z²; T = 1.0 corresponds to approximately 95 % primary
+  # consolidation.  Only relevant when response_mode = "transient".
+  t_final: 1.0
+
+  # Maximum number of explicit time steps for transient simulations.
+  # The solver will use the stability-limited step count up to this cap.
+  # Increase for high-fidelity production runs (the solver will warn when capped).
+  max_time_steps: 2000
+
 random_field:
   covariance: "matern"
+
+  # Smoothness parameter ν for the Matérn covariance kernel.
+  # nu_sampling: if true, ν is drawn uniformly from nu_range each sample.
+  # Set to false and provide nu_ref to use a fixed ν (required for a meaningful
+  # identity-mapping verification).
   nu_sampling: true
   nu_range: [0.5, 2.5]
+  nu_ref: 1.5         # fixed ν used when nu_sampling = false
+
+  # Length scale for the Matérn kernel.
+  # length_scale_sampling: if true, ℓ is drawn from length_scale_range per sample.
+  # Set to false and provide length_scale_ref for fixed length scale.
   length_scale_sampling: true
   length_scale_range: [0.1, 0.5]
+  length_scale_ref: 0.3   # fixed ℓ used when length_scale_sampling = false
 
 dimension_reducer:
+  # Reduced-space dimension.
+  # How many scalar parameters describe the low-dimensional material field.
+  # Must satisfy d ≤ n_kl_terms_E (KL basis) or d ≤ n_polynomial_basis (polynomial).
   d: 1
+
+  # Basis used to reconstruct the material field from reduced coefficients.
+  # Allowed values: "polynomial" | "kl"
+  # polynomial: multivariate polynomial in (x/L_x, z/L_z); requires d ≤ poly basis size.
+  # kl         : truncated KL expansion using reference Matérn params (nu_ref, ls_ref).
   basis_type: "polynomial"
+
+  # Highest polynomial degree (only relevant for basis_type = "polynomial").
+  # Allowed values: 1 | 2 | 3 (higher orders add more basis functions)
+  # Order 1: 3 functions {1, x, z}
+  # Order 2: 6 functions {1, x, z, x², xz, z²}
+  # Order 3: 10 functions {… + x³, x²z, xz², z³}
   basis_order: 1
+
+  # Mapping model mode.
+  # Allowed values: "learned" | "identity"
+  # learned : train NN or PCE to map xi_E -> xi' (default).
+  # identity: bypass learning; use xi' = xi_E (first d components).
+  #           Requires d = dataset.n_kl_terms_E and best used with
+  #           nu_sampling = false, length_scale_sampling = false
+  #           for numerical equivalence verification.
+  mode: "learned"
+
   # Train multiple reducer types simultaneously, e.g. ["nn", "pce"].
   # If omitted, defaults to the surrogate.type above.
   # types: ["nn", "pce"]
@@ -49,20 +106,42 @@ dimension_reducer:
 reduced_lut:
   n_grid_points: 2000
   grid_type: "random"
-  # Reuse an existing LUT surrogate instead of recomputing it.
+
+  # Phase-2 surrogate reuse is currently disabled at the pipeline level.
+  # This flag is retained for documentation and future re-enabling, but it
+  # has no effect: the LUT and its surrogates are ALWAYS recomputed.
   reuse: false
   # path: models/reduced_lut  # custom directory for the LUT artifacts
 
 surrogate:
+  # Primary surrogate type for Phase 2 (LUT forward surrogate) and Phase 3
+  # (dimension reducer, unless dimension_reducer.types overrides it).
+  # Allowed values: "nn" | "pce"
   type: "nn"
+
+  # NN-specific hyperparameters (used when type = "nn" or types includes "nn")
   hidden_dim: 64
   n_blocks: 3
   epochs: 200
   learning_rate: 1.0e-3
   batch_size: 64
-  # Train multiple surrogate types simultaneously, e.g. ["nn", "pce"].
-  # If omitted, defaults to type above.
+
+  # PCE-specific hyperparameters (used when type = "pce" or types includes "pce")
+  # basis_order is shared with dimension_reducer.basis_order
+
+  # Train multiple surrogate types simultaneously for Phase 2 and/or Phase 3.
+  # e.g. ["nn", "pce"] to train both and produce a comparison plot.
+  # If omitted, defaults to [type] above.
   # types: ["nn", "pce"]
+
+collocation:
+  # Number of collocation points used in Phase-3 physics-driven training.
+  # Defaults to all LUT grid points (use reduced_lut.n_grid_points).
+  # n_points: 2000
+
+  # Optionally specify explicit physical x-positions for collocation markers
+  # in settlement comparison plots.  Leave commented to use all n_nodes_x positions.
+  # positions: [0.0, 0.25, 0.5, 0.75, 1.0]
 
 validation:
   train_fraction: 0.6

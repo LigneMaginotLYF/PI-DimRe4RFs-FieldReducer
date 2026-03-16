@@ -9,6 +9,40 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+class _IdentityReducer:
+    """
+    Trivial identity dimension reducer for verification purposes.
+
+    Maps xi_E → xi_E (first ``output_dim`` components).  When
+    ``output_dim == input_dim`` this is a true identity.
+
+    Used by Phase 3 when ``dimension_reducer.mode = 'identity'``.
+    """
+
+    def __init__(self, input_dim, output_dim):
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+
+    def predict(self, X):
+        X = np.asarray(X, dtype=float)
+        if X.ndim == 1:
+            return X[:self.output_dim]
+        return X[:, :self.output_dim]
+
+    def reduce(self, xi_E):
+        return self.predict(xi_E)
+
+    def save(self, path):
+        import pickle
+        with open(path, 'wb') as f:
+            pickle.dump(self, f)
+
+    def load(self, path):
+        import pickle
+        with open(path, 'rb') as f:
+            return pickle.load(f)
+
+
 class TrainingPipeline:
     """
     Orchestrates the complete four-phase framework.
@@ -34,8 +68,13 @@ class TrainingPipeline:
         self.timings = {}
 
     def _get_solver(self):
-        from src.forward_solver_2d import BiotSolver2D
-        return BiotSolver2D(self.config)
+        solver_type = self.config.get('solver', {}).get('type', '2d')
+        if solver_type == '1d':
+            from src.forward_solver_1d import BiotSolver1D
+            return BiotSolver1D(self.config)
+        else:
+            from src.forward_solver_2d import BiotSolver2D
+            return BiotSolver2D(self.config)
 
     def _get_field_generator(self):
         from src.field_generator import KLExpansionField
@@ -47,6 +86,7 @@ class TrainingPipeline:
             length_x=dom.get('length_x', 1.0),
             length_z=dom.get('length_z', 1.0),
         )
+
 
     def phase1_generate_dataset(self, n_samples=None, seed=None):
         """
@@ -90,6 +130,10 @@ class TrainingPipeline:
 
         nu_range = rf_cfg.get('nu_range', [0.5, 2.5])
         ls_range = rf_cfg.get('length_scale_range', [0.1, 0.5])
+        nu_sampling = rf_cfg.get('nu_sampling', True)
+        ls_sampling = rf_cfg.get('length_scale_sampling', True)
+        nu_ref = rf_cfg.get('nu_ref', 1.5)
+        ls_ref = rf_cfg.get('length_scale_ref', 0.3)
 
         rng = np.random.default_rng(seed)
         solver = self._get_solver()
@@ -101,8 +145,8 @@ class TrainingPipeline:
         for i in range(n_samples):
             if i % 50 == 0:
                 logger.info(f"Phase 1: sample {i}/{n_samples}")
-            nu = rng.uniform(*nu_range)
-            length_scale = rng.uniform(*ls_range)
+            nu = rng.uniform(*nu_range) if nu_sampling else nu_ref
+            length_scale = rng.uniform(*ls_range) if ls_sampling else ls_ref
             xi_E = rng.standard_normal(n_kl)
             E_field = field_gen.generate_field(xi_E, nu, length_scale, n_terms=n_kl, E_ref=E_ref)
             Y = solver.run(E_field, k_h, k_v)
@@ -118,19 +162,22 @@ class TrainingPipeline:
         logger.info(f"X_train: {X_train.shape}, Y_train: {Y_train.shape}")
         return X_train, Y_train
 
-    def phase2_build_reduced_surrogate(self, seed=None, force_recompute=False):
+    def phase2_build_reduced_surrogate(self, seed=None):
         """
-        Build LUT, fit surrogate(s) S: xi'->Y', save for reuse.
+        Build LUT, fit surrogate(s) S: xi'->Y', and save artifacts.
 
         Supports multiple surrogate types via surrogate.types (list) in config.
         If only one type is requested, behaviour is identical to the original.
-        Respects reduced_lut.reuse config flag.
+
+        Phase-2 surrogate reuse is intentionally disabled: fresh training is
+        performed on every call to prevent stale-artifact contamination when
+        problem setup (dimension/regime/basis/etc.) changes.
 
         Returns the fitted ReducedLUT object (primary type loaded).
         """
         t0 = time.time()
         logger.info("=" * 60)
-        logger.info("PHASE 2: Building reduced surrogate (LUT)")
+        logger.info("PHASE 2: Building reduced surrogate (LUT) -- always recomputing")
         logger.info("=" * 60)
 
         ds_cfg = self.config.get('dataset', {})
@@ -147,41 +194,12 @@ class TrainingPipeline:
 
         lut_output_dir = os.path.join(self.models_dir, 'reduced_lut')
         solver = self._get_solver()
-        reuse = lut_cfg.get('reuse', False)
 
+        # Phase-2 surrogate reuse is intentionally disabled: always recompute
+        # so each run produces fresh artifacts and no stale model contaminates
+        # a changed problem setup.
         from src.reduced_lut import ReducedLUT
         lut = ReducedLUT(self.config, solver, output_dir=lut_output_dir)
-
-        # Compute config hash to detect dimension/basis changes
-        config_hash = lut.config_hash
-
-        # Check if we can reuse: config.json must exist, hash must match,
-        # and ALL requested surrogate types must have saved artifacts.
-        def _surrogate_artifact_exists(s_type):
-            if s_type == 'nn':
-                return (
-                    os.path.exists(os.path.join(lut_output_dir, 'surrogate_nn_full.pt'))
-                    or os.path.exists(os.path.join(lut_output_dir, 'surrogate_nn.pt'))
-                )
-            return os.path.exists(os.path.join(lut_output_dir, f'surrogate_{s_type}.pkl'))
-
-        config_path = os.path.join(lut_output_dir, 'config.json')
-        cached_hash_matches = False
-        if os.path.exists(config_path):
-            with open(config_path, 'r', encoding='utf-8') as _f:
-                _meta = json.load(_f)
-            cached_hash_matches = (_meta.get('config_hash') == config_hash)
-
-        all_types_cached = cached_hash_matches and all(
-            _surrogate_artifact_exists(t) for t in surrogate_types
-        )
-
-        if (reuse or not force_recompute) and all_types_cached:
-            logger.info(f"Phase 2: Found existing surrogate at {lut_output_dir}, loading for reuse")
-            lut.load(surrogate_type=surrogate_types[0])
-            self.timings['phase2'] = time.time() - t0
-            logger.info(f"Phase 2 loaded from cache in {self.timings['phase2']:.1f}s")
-            return lut
 
         lut.generate_grid(seed=seed)
         lut.precompute_responses()
@@ -198,8 +216,14 @@ class TrainingPipeline:
             r2_by_type[s_type] = r2_val
             logger.info(f"Phase 2 [{s_type}] R2={r2_val:.4f}")
 
-            # Phase-2 independent test-set evaluation
+            # Phase-2 independent test-set evaluation (metrics + settlement plots)
             self._phase2_evaluate_surrogate(lut, s_type, seed=seed)
+
+            # Phase-2 surrogate accuracy plots (scatter + profile comparison)
+            from src.visualization import Visualization
+            viz_p2 = Visualization(plots_dir=self.plots_dir)
+            viz_p2.plot_phase2_surrogate_accuracy(lut, surrogate_type=s_type,
+                                                  val_fraction=val_fraction, seed=seed)
 
         # Save LUT grid arrays to data/ for easy access
         np.save(os.path.join(self.data_dir, 'lut_grid_points.npy'), lut.grid_points)
@@ -311,6 +335,21 @@ class TrainingPipeline:
         input_dim = n_kl
         output_dim = red_cfg.get('d', 1)  # output dimension matches reduced space
 
+        # Identity mapping mode: bypass learned reducer
+        reducer_mode = red_cfg.get('mode', 'learned')
+        if reducer_mode == 'identity':
+            logger.info("Phase 3: identity mode -- using trivial identity reducer")
+            reducer = _IdentityReducer(input_dim=input_dim, output_dim=input_dim)
+            # Save reducer
+            import pickle
+            with open(os.path.join(self.models_dir, 'dimension_reducer_identity.pkl'), 'wb') as f:
+                pickle.dump(reducer, f)
+            np.save(os.path.join(self.data_dir, 'X_test.npy'), X_test)
+            np.save(os.path.join(self.data_dir, 'Y_test.npy'), Y_test)
+            self.timings['phase3'] = time.time() - t0
+            logger.info(f"Phase 3 (identity) done in {self.timings['phase3']:.2f}s")
+            return reducer, (X_test, Y_test)
+
         reducers = {}
         lut_output_dir = os.path.join(self.models_dir, 'reduced_lut')
         for r_type in reducer_types:
@@ -364,8 +403,10 @@ class TrainingPipeline:
             )
         else:
             from src.mapping_learner_pce import PolynomialChaosExpansion
+            # PCE degree comes from dimension_reducer.basis_order (authoritative).
+            # surrogate.basis_order is kept as a legacy fallback only.
             reducer = PolynomialChaosExpansion(
-                degree=surr_cfg.get('basis_order', 3),
+                degree=red_cfg.get('basis_order', surr_cfg.get('basis_order', 3)),
                 n_inputs=input_dim,
                 n_outputs=output_dim,
             )
@@ -410,16 +451,36 @@ class TrainingPipeline:
         xi_prime_pred = primary_reducer.predict(X_test)
         Y_pred = reduced_lut.predict(xi_prime_pred)
 
-        viz.plot_settlement_comparison(Y_test, Y_pred, n_samples=5)
+        # Identity-mode equivalence check
+        red_cfg = self.config.get('dimension_reducer', {})
+        if red_cfg.get('mode', 'learned') == 'identity':
+            identity_report = self._run_identity_check(X_test, Y_test, reduced_lut)
+            metrics.update(identity_report)
+
+        # Physical x-positions for settlement comparison plots
+        dom_cfg = self.config.get('domain', {})
+        sol_cfg = self.config.get('solver', {})
+        collocation_cfg = self.config.get('collocation', {})
+        n_x = sol_cfg.get('n_nodes_x', 20)
+        length_x = dom_cfg.get('length_x', 1.0)
+        # Allow explicit positions via config; default = uniform spacing
+        x_positions_cfg = collocation_cfg.get('positions', None)
+        if x_positions_cfg is not None:
+            x_positions = np.asarray(x_positions_cfg, dtype=float)
+        else:
+            x_positions = np.linspace(0.0, length_x, n_x)
+
+        viz.plot_settlement_comparison(Y_test, Y_pred, n_samples=5,
+                                       x_positions=x_positions)
         viz.plot_aggregate_metrics(Y_test, Y_pred)
         viz.plot_sobol_sensitivity(primary_reducer, input_dim=X_test.shape[1])
 
         # Collocation point visualizations (when LUT has training indices)
         if reduced_lut.train_indices is not None:
             viz.plot_settlement_comparison_with_collocation(
-                Y_test, Y_pred, reduced_lut, n_samples=5
+                Y_test, Y_pred, reduced_lut, n_samples=5,
+                x_positions=x_positions
             )
-            viz.plot_settlement_collocation_scatter(reduced_lut)
 
         # Material field comparison plots
         self._plot_material_field_comparison(
@@ -448,7 +509,92 @@ class TrainingPipeline:
         Y_pred = reduced_lut.predict(xi_prime_pred)
         return Validation.compute_metrics(Y_pred, Y_test)
 
-    def _plot_material_field_comparison(self, X_test, xi_prime_pred, viz, reduced_lut, n_samples=5):
+    def _run_identity_check(self, X_test, Y_test, reduced_lut):
+        """
+        Physical consistency check for identity-mapping mode.
+
+        In identity mode the reducer is a pass-through (xi' = xi_E).  The
+        settlement obtained by reconstructing the field from xi_E and running
+        the direct Biot solver should match the original settlement (Y_test)
+        up to the KL-basis reconstruction accuracy.
+
+        When ``random_field.nu_sampling`` and ``random_field.length_scale_sampling``
+        are both ``false`` (recommended for identity mode), the reconstruction
+        uses the same fixed KL basis as Phase 1 and the residual error is at
+        machine-precision level.
+
+        Saves the report to ``<output_dir>/identity_check.json``.
+
+        Returns a dict of identity-check metrics (max_abs_error, rmse, r2) that
+        is merged into the main metrics.
+        """
+        from src.validation import Validation
+
+        rf_cfg = self.config.get('random_field', {})
+        ds_cfg = self.config.get('dataset', {})
+        mat_cfg = self.config.get('material', {})
+        n_kl = ds_cfg.get('n_kl_terms_E', 5)
+        E_ref = mat_cfg.get('E_ref', 10.0e6)
+        k_h = mat_cfg.get('permeability_h', 1.0e-12)
+        k_v = mat_cfg.get('permeability_v', 1.0e-12)
+        nu_sampling = rf_cfg.get('nu_sampling', True)
+        ls_sampling = rf_cfg.get('length_scale_sampling', True)
+        nu_ref = rf_cfg.get('nu_ref', 1.5)
+        ls_ref = rf_cfg.get('length_scale_ref', 0.3)
+
+        if nu_sampling or ls_sampling:
+            logger.warning(
+                "Identity check: nu_sampling or length_scale_sampling is True. "
+                "For exact identity (machine-precision error), set both to false "
+                "so Phase-1 generation and Phase-2 reconstruction share the same "
+                "KL basis.  Reported errors will include KL-basis mismatch."
+            )
+
+        field_gen = self._get_field_generator()
+        solver = self._get_solver()
+        seed = ds_cfg.get('seed', 42)
+        # Use SeedSequence to spawn an independent child stream; avoids
+        # potential arithmetic overflow and is statistically sound.
+        rng = np.random.default_rng(
+            np.random.SeedSequence(seed).spawn(1)[0]
+        )
+
+        nu_range = rf_cfg.get('nu_range', [0.5, 2.5])
+        ls_range = rf_cfg.get('length_scale_range', [0.1, 0.5])
+
+        n = len(X_test)
+        Y_direct = np.zeros_like(Y_test)
+        for i in range(n):
+            nu = rng.uniform(*nu_range) if nu_sampling else nu_ref
+            length_scale = rng.uniform(*ls_range) if ls_sampling else ls_ref
+            E_field = field_gen.generate_field(
+                X_test[i], nu, length_scale, n_terms=n_kl, E_ref=E_ref
+            )
+            Y_direct[i] = solver.run(E_field, k_h, k_v)
+
+        metrics_direct = Validation.compute_metrics(Y_direct, Y_test)
+        max_abs = float(np.max(np.abs(Y_direct - Y_test)))
+
+        report = {
+            'identity_check_max_abs_error': max_abs,
+            'identity_check_rmse': metrics_direct['rmse'],
+            'identity_check_r2': metrics_direct['r2'],
+        }
+
+        report_path = os.path.join(self.output_dir, 'identity_check.json')
+        with open(report_path, 'w', encoding='utf-8') as f:
+            json.dump(report, f, indent=2)
+
+        logger.info(
+            f"Identity check: max_abs={max_abs:.4e}, "
+            f"RMSE={metrics_direct['rmse']:.4e}, "
+            f"R2={metrics_direct['r2']}"
+        )
+        return report
+
+    def _plot_material_field_comparison(
+        self, X_test, xi_prime_pred, viz, reduced_lut, n_samples=5
+    ):
         """
         Generate and save material field comparison plots.
 
@@ -478,8 +624,12 @@ class TrainingPipeline:
         k_v_values = []
 
         for i in range(n):
-            nu = rng.uniform(*nu_range)
-            length_scale = rng.uniform(*ls_range)
+            nu_sampling = rf_cfg.get('nu_sampling', True)
+            ls_sampling = rf_cfg.get('length_scale_sampling', True)
+            nu_ref = rf_cfg.get('nu_ref', 1.5)
+            ls_ref = rf_cfg.get('length_scale_ref', 0.3)
+            nu = rng.uniform(*nu_range) if nu_sampling else nu_ref
+            length_scale = rng.uniform(*ls_range) if ls_sampling else ls_ref
             E_field = field_gen.generate_field(
                 X_test[i], nu, length_scale, n_terms=n_kl, E_ref=E_ref
             )
