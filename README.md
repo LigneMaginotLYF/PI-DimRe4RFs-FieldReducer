@@ -86,7 +86,7 @@ results/<run_id>/
   run_summary.txt          Config, timings, metrics, artifact paths
 ```
 
-**Note:** `data/`, `models/`, and `plots/` are shared across runs for reuse. Phase 2 uses cached surrogate artifacts automatically if `models/reduced_lut/config.json` exists.
+**Note:** `data/`, `models/`, and `plots/` directories may accumulate artifacts across runs. Phase 2 **always recomputes** the LUT and retrains the surrogate on every run (cache reuse is intentionally disabled to prevent stale-artifact contamination when the problem setup changes). Set `dataset.reuse: true` in `config.yaml` to reuse an existing Phase-1 dataset.
 
 ---
 

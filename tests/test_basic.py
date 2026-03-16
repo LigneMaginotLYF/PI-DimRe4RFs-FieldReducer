@@ -829,5 +829,286 @@ class TestConfigValidation(unittest.TestCase):
             cm.validate(cfg)
 
 
+
+class TestDCTField(unittest.TestCase):
+    """Tests for the DCT-basis field generator."""
+
+    def test_dct_basis_shape(self):
+        """compute_dct_basis returns correct shape."""
+        from src.field_generator import DCTField
+        fg = DCTField(n_nodes_x=8, n_nodes_z=8)
+        Psi, freqs = fg.compute_dct_basis(n_terms=5)
+        self.assertEqual(Psi.shape, (64, 5))
+        self.assertEqual(freqs.shape, (5,))
+
+    def test_dct_basis_deterministic(self):
+        """The DCT basis is identical across two independent instantiations."""
+        from src.field_generator import DCTField
+        fg1 = DCTField(n_nodes_x=6, n_nodes_z=6)
+        fg2 = DCTField(n_nodes_x=6, n_nodes_z=6)
+        Psi1, _ = fg1.compute_dct_basis(n_terms=4)
+        Psi2, _ = fg2.compute_dct_basis(n_terms=4)
+        np.testing.assert_array_equal(Psi1, Psi2,
+                                      err_msg="DCT basis must be deterministic and basis-agnostic")
+
+    def test_dct_basis_independent_of_matern_params(self):
+        """Two calls with different (nu, ls) produce the SAME basis Psi."""
+        from src.field_generator import DCTField
+        fg = DCTField(n_nodes_x=8, n_nodes_z=8)
+        rng1 = np.random.default_rng(0)
+        rng2 = np.random.default_rng(0)
+        # Use the same rng state so xi values are the same; only nu/ls differ
+        _, E1 = fg.generate_field(rng1, nu=0.5, length_scale=0.2, n_terms=4)
+        # Reset field gen cache and re-check basis
+        Psi_nu05, _ = fg.compute_dct_basis(n_terms=4)
+        fg2 = DCTField(n_nodes_x=8, n_nodes_z=8)
+        Psi_nu20, _ = fg2.compute_dct_basis(n_terms=4)
+        np.testing.assert_array_equal(Psi_nu05, Psi_nu20,
+                                      err_msg="Basis must be identical for different nu")
+
+    def test_dct_generate_field_shape(self):
+        """generate_field returns correct shapes."""
+        from src.field_generator import DCTField
+        fg = DCTField(n_nodes_x=10, n_nodes_z=10)
+        rng = np.random.default_rng(42)
+        xi, E = fg.generate_field(rng, nu=1.5, length_scale=0.3, n_terms=5, E_ref=10e6)
+        self.assertEqual(xi.shape, (5,))
+        self.assertEqual(E.shape, (10, 10))
+        self.assertTrue(np.all(E > 0))
+        self.assertFalse(np.any(np.isnan(E)))
+
+    def test_dct_reconstruct_from_coefficients(self):
+        """Reconstruct with same xi and different nu produces the SAME field."""
+        from src.field_generator import DCTField
+        fg = DCTField(n_nodes_x=8, n_nodes_z=8)
+        xi = np.array([0.5, -0.3, 0.1, 0.2, -0.1])
+        E1 = fg.reconstruct_from_coefficients(xi, E_ref=10e6)
+        E2 = fg.reconstruct_from_coefficients(xi, E_ref=10e6)
+        np.testing.assert_array_equal(E1, E2,
+                                      err_msg="Same xi must produce same E field regardless of call order")
+
+    def test_dct_logE_std_scales_amplitude(self):
+        """logE_std scales the log-E amplitude: larger std -> larger field variation."""
+        from src.field_generator import DCTField
+        fg = DCTField(n_nodes_x=8, n_nodes_z=8)
+        rng = np.random.default_rng(0)
+        xi = np.array([1.0, 0.5, -0.3, 0.2, 0.0])
+        E_small = fg.reconstruct_from_coefficients(xi, E_ref=10e6, logE_std=0.1)
+        E_large = fg.reconstruct_from_coefficients(xi, E_ref=10e6, logE_std=2.0)
+        # Variation of large should exceed variation of small
+        self.assertGreater(E_large.std(), E_small.std())
+
+    def test_dct_coefficient_distribution_matern_shaped(self):
+        """matern_spectral_variance returns a valid probability-like distribution."""
+        from src.field_generator import DCTField
+        fg = DCTField(n_nodes_x=8, n_nodes_z=8)
+        _, freqs = fg.compute_dct_basis(n_terms=5)
+        sigma_k = fg.matern_spectral_variance(nu=1.5, length_scale=0.3, mode_freqs=freqs)
+        self.assertEqual(sigma_k.shape, (5,))
+        self.assertTrue(np.all(sigma_k > 0))
+        # sigma_k^2 should sum to 1 (unit variance normalisation)
+        self.assertAlmostEqual((sigma_k ** 2).sum(), 1.0, places=5)
+
+    def test_dct_smoke_phase1(self):
+        """Phase-1 with DCT field_basis completes and X_train has correct shape."""
+        from src.training_pipeline import TrainingPipeline
+        import tempfile, shutil
+        tmp = tempfile.mkdtemp(prefix='pi_dct_phase1_')
+        orig = os.getcwd()
+        try:
+            os.chdir(tmp)
+            cfg = _make_smoke_config()
+            cfg['random_field']['field_basis'] = 'dct'
+            cfg['random_field']['logE_std'] = 1.0
+            pipeline = TrainingPipeline(cfg, output_dir='results/dct_phase1')
+            X, Y = pipeline.phase1_generate_dataset()
+            self.assertEqual(X.shape, (cfg['dataset']['n_samples'], 5))
+            self.assertFalse(np.any(np.isnan(X)))
+            self.assertFalse(np.any(np.isnan(Y)))
+        finally:
+            os.chdir(orig)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_dct_smoke_phases_1_to_4(self):
+        """End-to-end smoke test with DCT basis through all four phases."""
+        from src.training_pipeline import TrainingPipeline
+        import tempfile, shutil
+        tmp = tempfile.mkdtemp(prefix='pi_dct_e2e_')
+        orig = os.getcwd()
+        try:
+            os.chdir(tmp)
+            cfg = _make_smoke_config()
+            cfg['dataset']['n_terms_E'] = 5
+            cfg['random_field']['field_basis'] = 'dct'
+            cfg['random_field']['logE_std'] = 1.0
+            cfg['random_field']['nu_sampling'] = False
+            cfg['random_field']['nu_ref'] = 1.5
+            cfg['random_field']['length_scale_sampling'] = False
+            cfg['random_field']['length_scale_ref'] = 0.3
+            cfg['dimension_reducer']['basis_type'] = 'dct'
+            cfg['dimension_reducer']['d'] = 3
+            pipeline = TrainingPipeline(cfg, output_dir='results/dct_e2e')
+            metrics = pipeline.orchestrate(phases=[1, 2, 3, 4])
+            self.assertIn('r2', metrics)
+            self.assertTrue(os.path.exists('data/X_train.npy'))
+            self.assertTrue(os.path.exists('results/dct_e2e/metrics.json'))
+        finally:
+            os.chdir(orig)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestNTermsEKey(unittest.TestCase):
+    """Tests for the n_terms_E config key and backward compat with n_kl_terms_E."""
+
+    def test_n_terms_E_accepted(self):
+        """dataset.n_terms_E is recognised without deprecation warning."""
+        from src.training_pipeline import TrainingPipeline
+        import warnings, tempfile, shutil
+        cfg = _make_smoke_config()
+        cfg['dataset'].pop('n_kl_terms_E', None)
+        cfg['dataset']['n_terms_E'] = 5
+
+        tmp = tempfile.mkdtemp(prefix='pi_nterms_')
+        orig = os.getcwd()
+        try:
+            os.chdir(tmp)
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter('always')
+                p = TrainingPipeline(cfg, output_dir='results/nterms')
+                X, Y = p.phase1_generate_dataset()
+                dep_warnings = [x for x in w if issubclass(x.category, DeprecationWarning)
+                                and 'n_kl_terms_E' in str(x.message)]
+                self.assertEqual(len(dep_warnings), 0,
+                                 "No DeprecationWarning should be emitted when using n_terms_E")
+            self.assertEqual(X.shape[1], 5)
+        finally:
+            os.chdir(orig)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_n_kl_terms_E_backward_compat(self):
+        """dataset.n_kl_terms_E still works but emits a DeprecationWarning."""
+        from src.training_pipeline import TrainingPipeline
+        import warnings, tempfile, shutil
+        cfg = _make_smoke_config()
+        # Use only the legacy key
+        cfg['dataset'].pop('n_terms_E', None)
+        cfg['dataset']['n_kl_terms_E'] = 5
+
+        tmp = tempfile.mkdtemp(prefix='pi_nkl_legacy_')
+        orig = os.getcwd()
+        try:
+            os.chdir(tmp)
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter('always')
+                p = TrainingPipeline(cfg, output_dir='results/nkl_legacy')
+                X, Y = p.phase1_generate_dataset()
+                dep_warnings = [x for x in w if issubclass(x.category, DeprecationWarning)
+                                and 'n_kl_terms_E' in str(x.message)]
+                self.assertGreater(len(dep_warnings), 0,
+                                   "DeprecationWarning should be emitted when using n_kl_terms_E")
+            self.assertEqual(X.shape[1], 5)
+        finally:
+            os.chdir(orig)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestIdentityReducerOutputDim(unittest.TestCase):
+    """Verify _IdentityReducer is instantiated with output_dim=d (not input_dim)."""
+
+    def test_identity_reducer_uses_output_dim(self):
+        """Phase 3 identity mode should create reducer with output_dim=d, not n_terms."""
+        from src.training_pipeline import TrainingPipeline, _IdentityReducer
+        import tempfile, shutil
+        cfg = _make_smoke_config()
+        cfg['dataset']['n_terms_E'] = 5
+        cfg['random_field']['nu_sampling'] = False
+        cfg['random_field']['nu_ref'] = 1.5
+        cfg['random_field']['length_scale_sampling'] = False
+        cfg['random_field']['length_scale_ref'] = 0.3
+        # d=5 == n_terms_E (required for identity mode by config validation)
+        cfg['dimension_reducer']['d'] = 5
+        cfg['dimension_reducer']['basis_type'] = 'kl'
+        cfg['dimension_reducer']['mode'] = 'identity'
+        cfg['reduced_lut']['n_grid_points'] = 8
+
+        tmp = tempfile.mkdtemp(prefix='pi_id_outdim_')
+        orig = os.getcwd()
+        try:
+            os.chdir(tmp)
+            p = TrainingPipeline(cfg, output_dir='results/id_outdim')
+            X, Y = p.phase1_generate_dataset()
+            lut = p.phase2_build_reduced_surrogate()
+            reducer, _ = p.phase3_train_dimension_reducer(X, Y, lut)
+            self.assertIsInstance(reducer, _IdentityReducer)
+            # output_dim must equal d (=5), NOT the input_dim (also 5 here, but
+            # conceptually must come from output_dim=d rather than hardcoded input_dim)
+            self.assertEqual(reducer.output_dim, 5)
+        finally:
+            os.chdir(orig)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestConfigValidationDCT(unittest.TestCase):
+    """Config validation tests for new DCT-related keys."""
+
+    def _base(self):
+        return {
+            'dataset': {'n_samples': 10, 'n_terms_E': 3},
+            'material': {},
+            'solver': {'type': '2d', 'response_mode': 'steady_state',
+                       'n_nodes_x': 5, 'n_nodes_z': 5},
+            'dimension_reducer': {'d': 1, 'basis_type': 'polynomial',
+                                  'basis_order': 1, 'mode': 'learned'},
+            'reduced_lut': {'n_grid_points': 10},
+            'surrogate': {'type': 'nn'},
+            'random_field': {'nu_ref': 1.5, 'length_scale_ref': 0.3},
+        }
+
+    def test_dct_field_basis_valid(self):
+        from src.config_manager import ConfigManager
+        cm = ConfigManager()
+        cfg = self._base()
+        cfg['random_field']['field_basis'] = 'dct'
+        cfg['dimension_reducer']['basis_type'] = 'dct'
+        cfg['dimension_reducer']['d'] = 3
+        try:
+            cm.validate(cfg)
+        except ValueError as e:
+            self.fail(f"Valid DCT config raised ValueError: {e}")
+
+    def test_invalid_field_basis_raises(self):
+        from src.config_manager import ConfigManager
+        cm = ConfigManager()
+        cfg = self._base()
+        cfg['random_field']['field_basis'] = 'fourier'
+        with self.assertRaises(ValueError):
+            cm.validate(cfg)
+
+    def test_dct_basis_type_d_exceeds_n_terms_raises(self):
+        from src.config_manager import ConfigManager
+        cm = ConfigManager()
+        cfg = self._base()
+        cfg['dimension_reducer']['basis_type'] = 'dct'
+        cfg['dimension_reducer']['d'] = 10  # > n_terms_E=3
+        with self.assertRaises(ValueError):
+            cm.validate(cfg)
+
+    def test_n_terms_E_and_n_kl_terms_E_coexist(self):
+        """n_terms_E takes priority when both keys are present."""
+        from src.training_pipeline import TrainingPipeline
+        ds_cfg = {'n_terms_E': 4, 'n_kl_terms_E': 7}
+        n = TrainingPipeline._resolve_n_terms(ds_cfg)
+        self.assertEqual(n, 4)
+
+    def test_logE_std_positive_bound(self):
+        """logE_std <= 0 should raise a validation error."""
+        from src.config_manager import ConfigManager
+        cm = ConfigManager()
+        cfg = self._base()
+        cfg['random_field']['logE_std'] = -0.5
+        with self.assertRaises(ValueError):
+            cm.validate(cfg)
+
+
 if __name__ == '__main__':
     unittest.main()

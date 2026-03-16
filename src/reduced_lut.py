@@ -82,6 +82,11 @@ class ReducedLUT:
                 f"nu_ref={rf_cfg.get('nu_ref', 1.5)}",
                 f"ls_ref={rf_cfg.get('length_scale_ref', 0.3)}",
             ]
+        if self.basis_type == 'dct':
+            # DCT basis is fixed; hash includes domain dimensions (grid already hashed
+            # via n_nodes_x, n_nodes_z) and logE_std if set.
+            logE_std = rf_cfg.get('logE_std', rf_cfg.get('field_fluctuation_scale', 1.0))
+            parts.append(f"logE_std={logE_std}")
         key = "_".join(parts)
         return hashlib.md5(key.encode()).hexdigest()[:8]
 
@@ -179,6 +184,29 @@ class ReducedLUT:
         fg = KLExpansionField(self.n_x, self.n_z, length_x, length_z)
         return fg.generate_field(xi_prime, nu_ref, ls_ref, n_terms=self.d, E_ref=self.E_ref)
 
+    def _reconstruct_field_dct(self, xi_prime):
+        """
+        Reconstruct material field using the first d DCT-II basis modes.
+
+        Uses the same fixed 2D DCT-II basis as DCTField in field_generator.py,
+        ensuring consistency between Phase-1 field generation and Phase-2 LUT
+        reconstruction when random_field.field_basis = "dct".
+
+        Args:
+            xi_prime: DCT coefficients, shape (d,)
+        Returns:
+            E_field: shape (n_z, n_x)
+        """
+        from src.field_generator import DCTField
+        dom = self.config.get('domain', {})
+        rf_cfg = self.config.get('random_field', {})
+        length_x = dom.get('length_x', 1.0)
+        length_z = dom.get('length_z', 1.0)
+        logE_std = rf_cfg.get('logE_std', rf_cfg.get('field_fluctuation_scale', 1.0))
+
+        fg = DCTField(self.n_x, self.n_z, length_x, length_z)
+        return fg.reconstruct_from_coefficients(xi_prime, E_ref=self.E_ref, logE_std=logE_std)
+
     def _reconstruct_field(self, xi_prime):
         """
         Reconstruct material E field from d-dimensional reduced coefficients.
@@ -192,8 +220,12 @@ class ReducedLUT:
             return self._reconstruct_field_polynomial(xi_prime)
         elif self.basis_type == 'kl':
             return self._reconstruct_field_kl(xi_prime)
+        elif self.basis_type == 'dct':
+            return self._reconstruct_field_dct(xi_prime)
         else:
-            raise ValueError(f"Unknown basis_type: {self.basis_type!r}. Use 'polynomial' or 'kl'.")
+            raise ValueError(
+                f"Unknown basis_type: {self.basis_type!r}. Use 'polynomial', 'kl', or 'dct'."
+            )
 
     def precompute_responses(self, field_generator=None):
         """
