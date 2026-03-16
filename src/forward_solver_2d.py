@@ -5,11 +5,20 @@ import scipy.sparse.linalg as spla
 
 class BiotSolver2D:
     """
-    2D steady-state Biot consolidation solver using finite differences.
+    2D Biot consolidation solver using finite differences.
 
-    Flow equation: k_h * d²p/dx² + k_v * d²p/dz² = 0
+    Supports both *steady-state* and *transient* response modes controlled by
+    ``solver.response_mode`` in the configuration dict.
 
-    Boundary conditions:
+    **Steady-state** flow equation::
+
+        k_h * d²p/dx² + k_v * d²p/dz² = 0
+
+    **Transient** flow equation (Terzaghi-Biot diffusion)::
+
+        ∂p/∂t = k_h/γ_w * ∂²p/∂x² + k_v/γ_w * ∂²p/∂z²
+
+    Boundary conditions (both modes):
       - Bottom (z=0): p = p_bottom (uniform fixed pressure)
       - Top (z=L_z): p = 0 (fully permeable, all nodes drain)
       - Left/Right sides: dp/dn = 0 (no-flow)
@@ -30,6 +39,12 @@ class BiotSolver2D:
         self.b = mat.get('biot_coefficient', 0.8)
         self.q = mat.get('applied_load', 1.0e6)
         self.p_bottom = mat.get('pore_pressure_bottom', 1.0e5)
+
+        self.response_mode = sol.get('response_mode', 'steady_state')
+        # Non-dimensional final time (T = c_v · t / L_z²; 1.0 ≈ 95% consolidation)
+        self.T_final = float(sol.get('t_final', 1.0))
+        # Maximum explicit time steps (configurable via solver.max_time_steps).
+        self.max_time_steps = int(sol.get('max_time_steps', 2000))
 
         self.dx = self.L_x / (self.n_x - 1)
         self.dz = self.L_z / (self.n_z - 1)
@@ -125,18 +140,81 @@ class BiotSolver2D:
 
     def run(self, E_field, k_h, k_v):
         """
-        Run complete 2D steady-state Biot solver.
+        Run complete 2D Biot solver (steady-state or transient).
 
         Args:
             E_field: Young's modulus field, shape (n_z, n_x) [Pa]
-            k_h: horizontal permeability [m^2]
-            k_v: vertical permeability [m^2]
+            k_h: horizontal permeability [m²]
+            k_v: vertical permeability [m²]
         Returns:
             settlement: surface settlement profile, shape (n_x,) [m]
         """
-        p_field = self.solve_flow(k_h, k_v)
-        settlement = self.compute_settlement(E_field, p_field)
-        return settlement
+        if self.response_mode == 'steady_state':
+            p_field = self.solve_flow(k_h, k_v)
+        elif self.response_mode == 'transient':
+            p_field = self._solve_transient(k_h, k_v, E_field)
+        else:
+            raise ValueError(
+                f"Unknown response_mode {self.response_mode!r}. "
+                "Use 'steady_state' or 'transient'."
+            )
+        return self.compute_settlement(E_field, p_field)
+
+    def _solve_transient(self, k_h, k_v, E_field):
+        """
+        Forward-Euler time-stepping for 2-D Biot diffusion.
+
+        Returns the pressure field at t = T_final.
+        """
+        M_v = E_field * (1.0 - self.nu) / ((1.0 + self.nu) * (1.0 - 2.0 * self.nu))
+        gamma_w = 1.0e4  # N/m³ (unit weight of water)
+        c_v = float(k_v * np.mean(M_v)) / gamma_w  # representative diffusivity
+
+        c_v_safe = max(c_v, 1.0e-30)
+        t_final = self.T_final * self.L_z ** 2 / c_v_safe
+
+        dt_stable = 0.25 * min(self.dx, self.dz) ** 2 / c_v_safe
+        n_steps = max(50, int(np.ceil(t_final / dt_stable)))
+        _max_steps = int(self.max_time_steps)
+        if n_steps > _max_steps:
+            import warnings
+            warnings.warn(
+                f"BiotSolver2D transient: required {n_steps} time steps for "
+                f"stability, but capped at {_max_steps} (solver.max_time_steps). "
+                "Physical accuracy may be reduced. Increase max_time_steps or "
+                "use a coarser grid to improve fidelity.",
+                UserWarning, stacklevel=3,
+            )
+        n_steps = min(n_steps, _max_steps)
+        dt = t_final / n_steps
+
+        rx = c_v_safe * dt / self.dx ** 2
+        rz = c_v_safe * dt / self.dz ** 2
+        # Clamp to enforce von-Neumann stability
+        scale = max(1.0, (rx + rz) / 0.49)
+        rx, rz = rx / scale, rz / scale
+
+        # Initial excess pore pressure = b * q (undrained response at t=0)
+        p = np.full((self.n_z, self.n_x), self.b * self.q)
+        p[0, :] = self.p_bottom   # bottom BC
+        p[-1, :] = 0.0            # top BC
+
+        for _ in range(n_steps):
+            p_new = p.copy()
+            p_new[1:-1, 1:-1] = (
+                p[1:-1, 1:-1]
+                + rx * (p[1:-1, 2:] - 2.0 * p[1:-1, 1:-1] + p[1:-1, :-2])
+                + rz * (p[2:, 1:-1] - 2.0 * p[1:-1, 1:-1] + p[:-2, 1:-1])
+            )
+            # Left/right: no-flow (Neumann) → copy interior
+            p_new[1:-1, 0] = p_new[1:-1, 1]
+            p_new[1:-1, -1] = p_new[1:-1, -2]
+            # Top/bottom BCs
+            p_new[0, :] = self.p_bottom
+            p_new[-1, :] = 0.0
+            p = p_new
+
+        return p
 
 
 class BiotsConsolidationSolver2D(BiotSolver2D):

@@ -55,9 +55,30 @@ class Visualization:
         import matplotlib.pyplot as plt
         return plt
 
-    def plot_settlement_comparison(self, Y_original, Y_predicted, n_samples=5):
-        """Plot original vs predicted settlement profiles for n_samples."""
+    def plot_settlement_comparison(self, Y_original, Y_predicted, n_samples=5,
+                                    x_positions=None):
+        """
+        Plot GT vs reduced-space predicted settlement profiles.
+
+        Two curves per panel:
+          - Blue solid line  : Ground-truth (GT) settlement profile
+          - Red dashed line  : Reduced-space prediction
+        The GT curve is drawn with no markers; call
+        ``plot_settlement_comparison_with_collocation`` to additionally mark
+        collocation x-positions on the GT curve.
+
+        Args:
+            Y_original   : Reference settlement profiles, shape (n_test, n_x)
+            Y_predicted  : Predicted settlement profiles, shape (n_test, n_x)
+            n_samples    : Number of random samples to plot
+            x_positions  : Physical x-coordinates, shape (n_x,).  Defaults to
+                           0, 1, ..., n_x-1 (node indices).
+        """
         plt = self._get_plt()
+        n_x = Y_original.shape[1]
+        if x_positions is None:
+            x_positions = np.arange(n_x)
+
         n = min(n_samples, len(Y_original))
         rng = np.random.default_rng(42)
         indices = rng.choice(len(Y_original), size=n, replace=False)
@@ -67,11 +88,11 @@ class Visualization:
             axes = [axes]
 
         for ax, idx in zip(axes, indices):
-            x = np.arange(Y_original.shape[1])
-            ax.plot(x, Y_original[idx], 'b-', label='Original', linewidth=2)
-            ax.plot(x, Y_predicted[idx], 'r--', label='Reduced', linewidth=2)
+            ax.plot(x_positions, Y_original[idx], 'b-', label='GT', linewidth=2)
+            ax.plot(x_positions, Y_predicted[idx], 'r--',
+                    label='Reduced-space prediction', linewidth=2)
             ax.set_title(f'Sample {idx}')
-            ax.set_xlabel('x node')
+            ax.set_xlabel('x position')
             ax.set_ylabel('Settlement [m]')
             ax.legend()
             ax.grid(True, alpha=0.3)
@@ -254,17 +275,35 @@ class Visualization:
         viz.plot_material_fields(fields)
 
     def plot_settlement_comparison_with_collocation(self, Y_original, Y_predicted,
-                                                     reduced_lut, n_samples=5):
+                                                     reduced_lut, n_samples=5,
+                                                     x_positions=None):
         """
-        Plot original vs predicted settlement profiles with collocation points overlay.
+        Plot GT vs reduced-space settlement profiles with collocation positions marked.
+
+        Layout per panel:
+          - Blue solid line       : GT settlement profile
+          - Red dashed line       : Reduced-space prediction
+          - Green circle markers  : GT values at collocation x-positions
+            (marks WHERE the collocation constraints are applied – NOT independent
+            scatter clouds from random LUT training settlements)
+
+        The collocation x-positions are the physical positions of the output nodes
+        used in Phase-2 training.  By default all n_x output nodes are used;
+        if a subset is desired, pass ``x_positions`` as a subset of node coordinates.
 
         Args:
-            Y_original: Reference settlement profiles, shape (n_test, n_x)
-            Y_predicted: Predicted settlement profiles, shape (n_test, n_x)
-            reduced_lut: ReducedLUT object with grid_points, responses, train_indices
-            n_samples: Number of samples to plot
+            Y_original    : shape (n_test, n_x)
+            Y_predicted   : shape (n_test, n_x)
+            reduced_lut   : ReducedLUT with train_indices and responses attributes
+            n_samples     : Number of random test samples to plot
+            x_positions   : Physical x-coordinates of the n_x output nodes,
+                            shape (n_x,).  Defaults to 0, 1, ..., n_x-1.
         """
         plt = self._get_plt()
+        n_x = Y_original.shape[1]
+        if x_positions is None:
+            x_positions = np.arange(n_x)
+
         n = min(n_samples, len(Y_original))
         rng = np.random.default_rng(42)
         indices = rng.choice(len(Y_original), size=n, replace=False)
@@ -273,25 +312,20 @@ class Visualization:
         if n == 1:
             axes = [axes]
 
-        train_indices = reduced_lut.train_indices
-        collocation_settlements = reduced_lut.responses[train_indices]
-
         for ax, idx in zip(axes, indices):
-            x = np.arange(Y_original.shape[1])
+            # GT curve
+            ax.plot(x_positions, Y_original[idx], 'b-',
+                    label='GT', linewidth=2.5, zorder=3)
+            # Reduced-space prediction curve
+            ax.plot(x_positions, Y_predicted[idx], 'r--',
+                    label='Reduced-space prediction', linewidth=2.5, zorder=3)
+            # Collocation x-positions marked as circles ON the GT curve
+            ax.plot(x_positions, Y_original[idx], 'go',
+                    markersize=6, markerfacecolor='none', markeredgewidth=1.5,
+                    label='Collocation positions', zorder=4)
 
-            ax.plot(x, Y_original[idx], 'b-', label='Original', linewidth=2.5)
-            ax.plot(x, Y_predicted[idx], 'r--', label='Reduced', linewidth=2.5)
-
-            n_colloc_show = min(20, len(collocation_settlements))
-            colloc_idx = rng.choice(len(collocation_settlements),
-                                    size=n_colloc_show, replace=False)
-            for c_idx in colloc_idx:
-                ax.plot(x, collocation_settlements[c_idx], 'go', alpha=0.3, markersize=4)
-
-            ax.plot([], [], 'go', alpha=0.5, markersize=6,
-                    label='Collocation points (training)')
             ax.set_title(f'Sample {idx}')
-            ax.set_xlabel('x node')
+            ax.set_xlabel('x position')
             ax.set_ylabel('Settlement [m]')
             ax.legend(fontsize=9)
             ax.grid(True, alpha=0.3)
@@ -301,43 +335,80 @@ class Visualization:
                             'comparison_with_collocation.png')
         plt.savefig(path, dpi=100, bbox_inches='tight')
         plt.close(fig)
-        logger.info(f"Saved settlement comparison with collocation points to {path}")
+        logger.info(f"Saved settlement comparison with collocation positions to {path}")
 
-    def plot_settlement_collocation_scatter(self, reduced_lut):
+    def plot_phase2_surrogate_accuracy(self, reduced_lut, surrogate_type='nn',
+                                        val_fraction=0.2, seed=42):
         """
-        Create scatter plot of collocation point coverage in settlement space.
+        Generate and save accuracy plots for the Phase-2 forward surrogate.
 
-        Shows spatial position (x node) vs settlement value for all training
-        collocation points.  Helps visualize the physical constraints used when
-        training the surrogate.
+        Plots:
+          1. Scatter: predicted vs. actual settlement for all output nodes
+             (validation set)
+          2. A few example settlement profiles: surrogate vs. direct solver
+
+        Saved under ``<plots_dir>/phase2_surrogate/``.
 
         Args:
-            reduced_lut: ReducedLUT object with responses and train_indices
+            reduced_lut    : Fitted ReducedLUT with surrogate loaded.
+            surrogate_type : 'nn' or 'pce'.
+            val_fraction   : Fraction of LUT data used as validation.
+            seed           : Random seed for train/val split.
         """
         plt = self._get_plt()
+        rng = np.random.default_rng(seed)
 
-        train_indices = reduced_lut.train_indices
-        collocation_settlements = reduced_lut.responses[train_indices]
+        n = len(reduced_lut.grid_points)
+        idx = rng.permutation(n)
+        n_val = int(n * val_fraction)
+        val_idx = idx[:n_val]
 
-        fig, ax = plt.subplots(figsize=(12, 6))
+        X_val = reduced_lut.grid_points[val_idx]
+        Y_val = reduced_lut.responses[val_idx]
+        Y_pred_val = reduced_lut.surrogate.predict(X_val)
 
-        for i, y_profile in enumerate(collocation_settlements):
-            x_nodes = np.arange(len(y_profile))
-            ax.scatter(x_nodes, y_profile, alpha=0.4, s=20,
-                       c=np.full(len(y_profile), i), cmap='viridis',
-                       vmin=0, vmax=len(collocation_settlements))
+        surr_dir = os.path.join(self.plots_dir, 'phase2_surrogate')
+        os.makedirs(surr_dir, exist_ok=True)
 
-        ax.set_xlabel('x node')
-        ax.set_ylabel('Settlement [m]')
-        ax.set_title(
-            f'Collocation Points in Settlement Space '
-            f'(n={len(collocation_settlements)} training points)'
-        )
+        # --- Plot 1: predicted vs. actual scatter ---
+        fig, ax = plt.subplots(figsize=(6, 6))
+        y_flat = Y_val.ravel()
+        yp_flat = Y_pred_val.ravel()
+        ax.scatter(y_flat, yp_flat, alpha=0.3, s=5, color='steelblue')
+        lo, hi = min(y_flat.min(), yp_flat.min()), max(y_flat.max(), yp_flat.max())
+        ax.plot([lo, hi], [lo, hi], 'r--', linewidth=1.5, label='Perfect fit')
+        ax.set_xlabel('True settlement [m]')
+        ax.set_ylabel('Surrogate prediction [m]')
+        ax.set_title(f'Phase-2 surrogate ({surrogate_type}) – scatter (n_val={len(X_val)})')
+        ax.legend()
         ax.grid(True, alpha=0.3)
-
         plt.tight_layout()
-        path = os.path.join(self.plots_dir, 'settlement_comparison',
-                            'collocation_scatter.png')
-        plt.savefig(path, dpi=100, bbox_inches='tight')
+        scatter_path = os.path.join(surr_dir, f'scatter_{surrogate_type}.png')
+        plt.savefig(scatter_path, dpi=100, bbox_inches='tight')
         plt.close(fig)
-        logger.info(f"Saved collocation scatter plot to {path}")
+        logger.info(f"Saved Phase-2 surrogate scatter to {scatter_path}")
+
+        # --- Plot 2: example profiles ---
+        n_ex = min(5, len(X_val))
+        ex_idx = rng.choice(len(X_val), size=n_ex, replace=False)
+        x_pos = np.arange(Y_val.shape[1])
+
+        fig, axes = plt.subplots(1, n_ex, figsize=(4 * n_ex, 4))
+        if n_ex == 1:
+            axes = [axes]
+        for ax, i in zip(axes, ex_idx):
+            ax.plot(x_pos, Y_val[i], 'b-', label='Direct solver', linewidth=2)
+            ax.plot(x_pos, Y_pred_val[i], 'r--', label=f'Surrogate ({surrogate_type})',
+                    linewidth=2)
+            ax.set_xlabel('x position')
+            ax.set_ylabel('Settlement [m]')
+            ax.set_title(f'LUT point {val_idx[i]}')
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        profiles_path = os.path.join(surr_dir, f'profiles_{surrogate_type}.png')
+        plt.savefig(profiles_path, dpi=100, bbox_inches='tight')
+        plt.close(fig)
+        logger.info(f"Saved Phase-2 surrogate profiles to {profiles_path}")
+
+

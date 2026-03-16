@@ -54,14 +54,35 @@ class ReducedLUT:
         self.val_indices = None
 
     def _compute_config_hash(self):
-        """Compute a short hash of (d, basis_type, basis_order) to detect config changes.
+        """Compute a short hash of key parameters that affect the surrogate interface.
 
-        Only these three parameters determine the dimensionality and shape of the reduced
-        parameter space, and therefore the surrogate's input interface.  Physical constants
-        such as E_ref or permeability values do not change the surrogate input dimension and
-        are intentionally excluded from the hash.
+        The hash covers:
+        - reduced space: d, basis_type, basis_order
+        - solver: type (1d/2d), response_mode, n_nodes_x, n_nodes_z
+        - KL reference params (nu_ref, ls_ref) when basis_type='kl'
+
+        Changes to any of these require recomputing the LUT.
+        Physical constants (E_ref, permeability values) are intentionally excluded
+        because they affect only the magnitude of the surrogate output, not its
+        dimensionality or basis structure.
         """
-        key = f"d={self.d}_basis_type={self.basis_type}_basis_order={self.basis_order}"
+        sol_cfg = self.config.get('solver', {})
+        rf_cfg = self.config.get('random_field', {})
+        parts = [
+            f"d={self.d}",
+            f"basis_type={self.basis_type}",
+            f"basis_order={self.basis_order}",
+            f"solver_type={sol_cfg.get('type', '2d')}",
+            f"response_mode={sol_cfg.get('response_mode', 'steady_state')}",
+            f"n_nodes_x={self.n_x}",
+            f"n_nodes_z={self.n_z}",
+        ]
+        if self.basis_type == 'kl':
+            parts += [
+                f"nu_ref={rf_cfg.get('nu_ref', 1.5)}",
+                f"ls_ref={rf_cfg.get('length_scale_ref', 0.3)}",
+            ]
+        key = "_".join(parts)
         return hashlib.md5(key.encode()).hexdigest()[:8]
 
     def generate_grid(self, seed=None):
@@ -131,7 +152,15 @@ class ReducedLUT:
 
     def _reconstruct_field_kl(self, xi_prime):
         """
-        Reconstruct material field using truncated KL expansion with reference Matern parameters.
+        Reconstruct material field using truncated KL expansion.
+
+        The KL basis is evaluated with fixed reference Matérn parameters
+        (``random_field.nu_ref`` and ``random_field.length_scale_ref`` from
+        config, defaulting to 1.5 and 0.3 respectively).
+
+        For identity-mode verification, use the same reference values in Phase 1
+        by setting ``random_field.nu_sampling: false`` and
+        ``random_field.length_scale_sampling: false``.
 
         Args:
             xi_prime: KL coefficients, shape (d,)
@@ -140,12 +169,14 @@ class ReducedLUT:
         """
         from src.field_generator import KLExpansionField
         dom = self.config.get('domain', {})
+        rf_cfg = self.config.get('random_field', {})
         length_x = dom.get('length_x', 1.0)
         length_z = dom.get('length_z', 1.0)
 
+        nu_ref = rf_cfg.get('nu_ref', 1.5)
+        ls_ref = rf_cfg.get('length_scale_ref', 0.3)
+
         fg = KLExpansionField(self.n_x, self.n_z, length_x, length_z)
-        nu_ref = 1.5
-        ls_ref = 0.3
         return fg.generate_field(xi_prime, nu_ref, ls_ref, n_terms=self.d, E_ref=self.E_ref)
 
     def _reconstruct_field(self, xi_prime):

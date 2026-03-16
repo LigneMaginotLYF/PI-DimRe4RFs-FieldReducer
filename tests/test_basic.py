@@ -269,8 +269,8 @@ class TestSmokeRun(unittest.TestCase):
         self.assertIn('rmse', metrics)
         self.assertIn('rel_l2', metrics)
 
-    def test_phase2_reuse(self):
-        """Phase 2 reuse: second run loads cached surrogate without recomputing."""
+    def test_phase2_always_recomputes(self):
+        """Phase-2 LUT surrogate is ALWAYS recomputed (reuse disabled by design)."""
         from src.training_pipeline import TrainingPipeline
         import json
 
@@ -279,19 +279,22 @@ class TestSmokeRun(unittest.TestCase):
         p1 = TrainingPipeline(config, output_dir='results/reuse_first')
         p1.orchestrate(phases=[1, 2])
 
-        # Read the creation date from the first run's config.json
-        with open('models/reduced_lut/config.json') as f:
-            meta_first = json.load(f)
+        # Read the grid from the first run to check it changes
+        grid_first = np.load('models/reduced_lut/grid_points.npy')
 
-        # Second run: should load cached surrogate (config.json unchanged)
-        p2 = TrainingPipeline(config, output_dir='results/reuse_second')
+        # Second run: even if config.json exists, surrogate must be regenerated
+        # Use a different seed to confirm the grid is freshly sampled
+        config2 = _make_smoke_config()
+        config2['dataset']['seed'] = 7
+        p2 = TrainingPipeline(config2, output_dir='results/reuse_second')
         p2.orchestrate(phases=[2])
 
-        with open('models/reduced_lut/config.json') as f:
-            meta_second = json.load(f)
-
-        # The created_date should be unchanged (loaded, not regenerated)
-        self.assertEqual(meta_first['created_date'], meta_second['created_date'])
+        # Grid should be freshly sampled (different seed → different grid)
+        grid_second = np.load('models/reduced_lut/grid_points.npy')
+        self.assertFalse(
+            np.allclose(grid_first, grid_second),
+            msg="Phase-2 grid was identical in both runs – reuse may be incorrectly enabled",
+        )
 
     def test_full_pipeline_nn(self):
         """NN smoke run: all four phases complete."""
@@ -398,8 +401,8 @@ class TestSmokeRun(unittest.TestCase):
         self.assertTrue(os.path.exists('models/dimension_reducer_pce.pkl'))
 
     def test_collocation_visualization(self):
-        """plot_settlement_comparison_with_collocation and plot_settlement_collocation_scatter
-        produce output files when called with a LUT that has train_indices."""
+        """plot_settlement_comparison_with_collocation produces the correct output;
+        plot_phase2_surrogate_accuracy produces scatter and profile plots."""
         from src.training_pipeline import TrainingPipeline
 
         config = _make_smoke_config()
@@ -417,14 +420,413 @@ class TestSmokeRun(unittest.TestCase):
         Y_pred = lut.predict(xi_prime)
 
         viz.plot_settlement_comparison_with_collocation(Y_test, Y_pred, lut, n_samples=2)
-        viz.plot_settlement_collocation_scatter(lut)
+        viz.plot_phase2_surrogate_accuracy(lut, surrogate_type='nn',
+                                           val_fraction=0.2, seed=42)
 
         self.assertTrue(os.path.exists(
             'results/colloc_viz/plots/settlement_comparison/comparison_with_collocation.png'
         ))
         self.assertTrue(os.path.exists(
-            'results/colloc_viz/plots/settlement_comparison/collocation_scatter.png'
+            'results/colloc_viz/plots/phase2_surrogate/scatter_nn.png'
         ))
+
+
+class TestBiotSolver1D(unittest.TestCase):
+    """Tests for the 1-D Biot solver."""
+
+    def _make_config(self, response_mode='steady_state', n_x=1):
+        return {
+            'material': {
+                'poisson_ratio': 0.3,
+                'biot_coefficient': 0.8,
+                'applied_load': 1.0e6,
+                'pore_pressure_bottom': 1.0e5,
+            },
+            'domain': {'length_x': 1.0, 'length_z': 1.0},
+            'solver': {
+                'n_nodes_x': n_x,
+                'n_nodes_z': 10,
+                'response_mode': response_mode,
+                't_final': 0.1,
+            },
+        }
+    def test_steady_state_output_shape(self):
+        from src.forward_solver_1d import BiotSolver1D
+        solver = BiotSolver1D(self._make_config())
+        E_1d = np.full(10, 10.0e6)
+        result = solver.run(E_1d, k_h=1e-12, k_v=1e-12)
+        self.assertEqual(result.shape, (1,))
+
+    def test_steady_state_positive(self):
+        from src.forward_solver_1d import BiotSolver1D
+        solver = BiotSolver1D(self._make_config())
+        E_1d = np.full(10, 10.0e6)
+        result = solver.run(E_1d, k_h=1e-12, k_v=1e-12)
+        self.assertTrue(np.all(result >= 0), "Settlement must be non-negative")
+        self.assertFalse(np.any(np.isnan(result)), "Settlement must not be NaN")
+
+    def test_transient_output_shape(self):
+        from src.forward_solver_1d import BiotSolver1D
+        solver = BiotSolver1D(self._make_config(response_mode='transient'))
+        E_1d = np.full(10, 10.0e6)
+        result = solver.run(E_1d, k_h=1e-12, k_v=1e-12)
+        self.assertEqual(result.shape, (1,))
+        self.assertFalse(np.any(np.isnan(result)))
+
+    def test_output_compatible_with_2d_interface(self):
+        """1D solver with n_nodes_x=3 returns shape (3,) like 2D solver."""
+        from src.forward_solver_1d import BiotSolver1D
+        solver = BiotSolver1D(self._make_config(n_x=3))
+        E_1d = np.full(10, 10.0e6)
+        result = solver.run(E_1d, k_h=1e-12, k_v=1e-12)
+        self.assertEqual(result.shape, (3,))
+        # All values should be equal (1-D: no x-variation)
+        self.assertTrue(np.allclose(result, result[0]))
+
+    def test_stiffer_soil_gives_less_settlement(self):
+        """Doubling E should roughly halve settlement."""
+        from src.forward_solver_1d import BiotSolver1D
+        cfg = self._make_config()
+        solver = BiotSolver1D(cfg)
+        E_soft = np.full(10, 5.0e6)
+        E_hard = np.full(10, 10.0e6)
+        u_soft = solver.run(E_soft, k_h=1e-12, k_v=1e-12)[0]
+        u_hard = solver.run(E_hard, k_h=1e-12, k_v=1e-12)[0]
+        self.assertGreater(u_soft, u_hard)
+
+
+class TestBiotSolver2DTransient(unittest.TestCase):
+    """Tests for the transient mode of BiotSolver2D."""
+
+    def setUp(self):
+        self.config = {
+            'material': {
+                'poisson_ratio': 0.3,
+                'biot_coefficient': 0.8,
+                'applied_load': 1.0e6,
+                'pore_pressure_bottom': 1.0e5,
+            },
+            'domain': {'length_x': 1.0, 'length_z': 1.0},
+            'solver': {
+                'n_nodes_x': 5,
+                'n_nodes_z': 5,
+                'response_mode': 'transient',
+                't_final': 0.1,
+            },
+        }
+
+    def test_transient_output_shape(self):
+        from src.forward_solver_2d import BiotSolver2D
+        solver = BiotSolver2D(self.config)
+        E = np.full((5, 5), 10.0e6)
+        result = solver.run(E, k_h=1e-12, k_v=1e-12)
+        self.assertEqual(result.shape, (5,))
+        self.assertFalse(np.any(np.isnan(result)))
+
+    def test_transient_non_negative(self):
+        from src.forward_solver_2d import BiotSolver2D
+        solver = BiotSolver2D(self.config)
+        E = np.full((5, 5), 10.0e6)
+        result = solver.run(E, k_h=1e-12, k_v=1e-12)
+        self.assertTrue(np.all(result >= 0))
+
+
+def _make_1d_smoke_config():
+    """Minimal config for 1-D steady-state smoke tests."""
+    return {
+        'dataset': {'n_samples': 8, 'n_kl_terms_E': 2, 'seed': 1,
+                    'reuse': False},
+        'material': {
+            'E_ref': 10.0e6, 'permeability_ref': 1e-12,
+            'permeability_h': 1e-12, 'permeability_v': 1e-12,
+            'poisson_ratio': 0.3, 'biot_coefficient': 0.8,
+            'fluid_viscosity': 1e-3, 'porosity': 0.3,
+            'fluid_bulk_modulus': 2.2e9, 'applied_load': 1e6,
+            'pore_pressure_bottom': 1e5,
+        },
+        'domain': {'length_x': 1.0, 'length_z': 1.0},
+        'solver': {'type': '1d', 'response_mode': 'steady_state',
+                   'n_nodes_x': 1, 'n_nodes_z': 5},
+        'random_field': {'covariance': 'matern', 'nu_sampling': True,
+                         'nu_range': [0.5, 2.5], 'nu_ref': 1.5,
+                         'length_scale_sampling': True,
+                         'length_scale_range': [0.1, 0.5],
+                         'length_scale_ref': 0.3},
+        'dimension_reducer': {'d': 1, 'basis_type': 'polynomial',
+                               'basis_order': 1, 'mode': 'learned'},
+        'reduced_lut': {'n_grid_points': 6, 'grid_type': 'random',
+                        'reuse': False},
+        'surrogate': {'type': 'nn', 'hidden_dim': 8, 'n_blocks': 1,
+                      'epochs': 2, 'learning_rate': 1e-3, 'batch_size': 4},
+        'collocation': {},
+        'validation': {'train_fraction': 0.5, 'val_fraction': 0.25,
+                       'test_fraction': 0.25},
+    }
+
+
+def _make_transient_smoke_config():
+    """Minimal config for transient 2-D smoke tests."""
+    cfg = _make_smoke_config()
+    cfg['solver']['response_mode'] = 'transient'
+    cfg['solver']['t_final'] = 0.1
+    return cfg
+
+
+class TestSmokeRun1D(unittest.TestCase):
+    """Smoke tests for the complete 1-D pipeline."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix='pi_dimre_1d_')
+        self._orig_cwd = os.getcwd()
+        os.chdir(self.tmp_dir)
+
+    def tearDown(self):
+        os.chdir(self._orig_cwd)
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def test_1d_steady_phase1_shape(self):
+        """Phase 1 with 1-D solver produces settlement shape (n_samples, 1)."""
+        from src.training_pipeline import TrainingPipeline
+        cfg = _make_1d_smoke_config()
+        pipeline = TrainingPipeline(cfg, output_dir='results/test_1d_steady')
+        X, Y = pipeline.phase1_generate_dataset()
+        self.assertEqual(X.shape, (8, 2))
+        self.assertEqual(Y.shape, (8, 1))
+
+    def test_1d_steady_phases_1_2(self):
+        """Phases 1 and 2 complete without error for 1-D steady-state setup."""
+        from src.training_pipeline import TrainingPipeline
+        cfg = _make_1d_smoke_config()
+        pipeline = TrainingPipeline(cfg, output_dir='results/test_1d_ph12')
+        X, Y = pipeline.phase1_generate_dataset()
+        lut = pipeline.phase2_build_reduced_surrogate()
+        self.assertIsNotNone(lut)
+        self.assertEqual(lut.responses.shape[1], 1)
+
+
+class TestSmokeRunTransient(unittest.TestCase):
+    """Smoke tests for the complete transient pipeline."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix='pi_dimre_transient_')
+        self._orig_cwd = os.getcwd()
+        os.chdir(self.tmp_dir)
+
+    def tearDown(self):
+        os.chdir(self._orig_cwd)
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def test_transient_phase1_shape(self):
+        """Phase 1 with transient 2-D solver produces valid output shape."""
+        from src.training_pipeline import TrainingPipeline
+        cfg = _make_transient_smoke_config()
+        pipeline = TrainingPipeline(cfg, output_dir='results/test_transient')
+        X, Y = pipeline.phase1_generate_dataset()
+        n_x = cfg['solver']['n_nodes_x']
+        self.assertEqual(Y.shape, (cfg['dataset']['n_samples'], n_x))
+        self.assertFalse(np.any(np.isnan(Y)))
+
+    def test_transient_phases_1_2(self):
+        """Phases 1 and 2 complete without error for transient setup."""
+        from src.training_pipeline import TrainingPipeline
+        cfg = _make_transient_smoke_config()
+        pipeline = TrainingPipeline(cfg, output_dir='results/test_transient_ph12')
+        pipeline.orchestrate(phases=[1, 2])
+        self.assertTrue(os.path.exists('models/reduced_lut/config.json'))
+
+
+def _make_identity_smoke_config():
+    """Config for identity-mapping verification (fixed KL basis, d=n_kl)."""
+    cfg = _make_smoke_config()
+    cfg['dataset']['n_kl_terms_E'] = 2
+    cfg['random_field']['nu_sampling'] = False
+    cfg['random_field']['nu_ref'] = 1.5
+    cfg['random_field']['length_scale_sampling'] = False
+    cfg['random_field']['length_scale_ref'] = 0.3
+    cfg['dimension_reducer']['d'] = 2          # must equal n_kl_terms_E
+    cfg['dimension_reducer']['basis_type'] = 'kl'
+    cfg['dimension_reducer']['mode'] = 'identity'
+    cfg['reduced_lut']['n_grid_points'] = 8
+    return cfg
+
+
+class TestIdentityMapping(unittest.TestCase):
+    """Identity-mapping equivalence tests."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix='pi_dimre_identity_')
+        self._orig_cwd = os.getcwd()
+        os.chdir(self.tmp_dir)
+
+    def tearDown(self):
+        os.chdir(self._orig_cwd)
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def test_identity_reducer_predict(self):
+        """_IdentityReducer.predict returns first output_dim columns."""
+        from src.training_pipeline import _IdentityReducer
+        reducer = _IdentityReducer(input_dim=5, output_dim=3)
+        X = np.arange(20, dtype=float).reshape(4, 5)
+        out = reducer.predict(X)
+        self.assertEqual(out.shape, (4, 3))
+        np.testing.assert_array_equal(out, X[:, :3])
+
+    def test_identity_full_pipeline(self):
+        """Full pipeline with identity mode completes and reports low direct error."""
+        from src.training_pipeline import TrainingPipeline
+        cfg = _make_identity_smoke_config()
+        pipeline = TrainingPipeline(cfg, output_dir='results/test_identity')
+        pipeline.orchestrate(phases=[1, 2, 3, 4])
+
+        self.assertTrue(os.path.exists('results/test_identity/identity_check.json'))
+
+        import json
+        with open('results/test_identity/identity_check.json') as f:
+            report = json.load(f)
+
+        # With fixed nu/ls the direct-solver reconstruction should be near-perfect
+        self.assertIn('identity_check_max_abs_error', report)
+        max_err = report['identity_check_max_abs_error']
+        # Max absolute error should be very small (< 1 % of typical settlement)
+        self.assertLess(max_err, 0.1,
+                        msg=f"Identity check max abs error {max_err:.4e} is unexpectedly large")
+
+    def test_identity_phase3_returns_identity_reducer(self):
+        """Phase 3 in identity mode returns an _IdentityReducer instance."""
+        from src.training_pipeline import TrainingPipeline, _IdentityReducer
+        cfg = _make_identity_smoke_config()
+        pipeline = TrainingPipeline(cfg, output_dir='results/test_id_phase3')
+        X, Y = pipeline.phase1_generate_dataset()
+        lut = pipeline.phase2_build_reduced_surrogate()
+        reducer, _ = pipeline.phase3_train_dimension_reducer(X, Y, lut)
+        self.assertIsInstance(reducer, _IdentityReducer)
+
+
+class TestSettlementComparisonPlot(unittest.TestCase):
+    """Settlement comparison plot correctness tests."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix='pi_dimre_plot_')
+        self._orig_cwd = os.getcwd()
+        os.chdir(self.tmp_dir)
+
+    def tearDown(self):
+        os.chdir(self._orig_cwd)
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def test_settlement_comparison_lines_only(self):
+        """plot_settlement_comparison produces comparison.png with two curves."""
+        from src.visualization import Visualization
+        rng = np.random.default_rng(0)
+        Y_true = rng.standard_normal((5, 10)) * 0.01 + 0.05
+        Y_pred = Y_true + rng.standard_normal((5, 10)) * 0.001
+        x_pos = np.linspace(0.0, 1.0, 10)
+
+        out_dir = 'test_plot_lines/plots'
+        viz = Visualization(plots_dir=out_dir)
+        viz.plot_settlement_comparison(Y_true, Y_pred, n_samples=3,
+                                       x_positions=x_pos)
+        self.assertTrue(
+            os.path.exists(os.path.join(out_dir, 'settlement_comparison',
+                                        'comparison.png'))
+        )
+
+    def test_settlement_comparison_with_collocation_markers(self):
+        """plot_settlement_comparison_with_collocation marks positions on GT."""
+        from src.training_pipeline import TrainingPipeline
+        from src.visualization import Visualization
+
+        cfg = _make_smoke_config()
+        pipeline = TrainingPipeline(cfg, output_dir='results/test_plot_coll')
+        X, Y = pipeline.phase1_generate_dataset()
+        lut = pipeline.phase2_build_reduced_surrogate()
+
+        rng = np.random.default_rng(0)
+        n_x = cfg['solver']['n_nodes_x']
+        Y_true = rng.standard_normal((4, n_x)) * 0.01 + 0.05
+        Y_pred = Y_true + rng.standard_normal((4, n_x)) * 0.001
+
+        x_pos = np.linspace(0.0, 1.0, n_x)
+        out_dir = 'results/test_plot_coll/plots'
+        viz = Visualization(plots_dir=out_dir)
+        viz.plot_settlement_comparison_with_collocation(
+            Y_true, Y_pred, lut, n_samples=2, x_positions=x_pos
+        )
+        self.assertTrue(
+            os.path.exists(os.path.join(
+                out_dir, 'settlement_comparison', 'comparison_with_collocation.png'
+            ))
+        )
+
+
+class TestConfigValidation(unittest.TestCase):
+    """Config validation tests."""
+
+    def _base(self):
+        return {
+            'dataset': {'n_samples': 10, 'n_kl_terms_E': 3},
+            'material': {},
+            'solver': {'type': '2d', 'response_mode': 'steady_state',
+                       'n_nodes_x': 5, 'n_nodes_z': 5},
+            'dimension_reducer': {'d': 1, 'basis_type': 'polynomial',
+                                  'basis_order': 1, 'mode': 'learned'},
+            'reduced_lut': {'n_grid_points': 10},
+            'surrogate': {'type': 'nn'},
+            'random_field': {'nu_ref': 1.5, 'length_scale_ref': 0.3},
+        }
+
+    def test_valid_config_passes(self):
+        from src.config_manager import ConfigManager
+        cm = ConfigManager()
+        cfg = self._base()
+        try:
+            cm.validate(cfg)
+        except ValueError as e:
+            self.fail(f"Valid config raised ValueError: {e}")
+
+    def test_invalid_solver_type_raises(self):
+        from src.config_manager import ConfigManager
+        cm = ConfigManager()
+        cfg = self._base()
+        cfg['solver']['type'] = 'gibberish'
+        with self.assertRaises(ValueError):
+            cm.validate(cfg)
+
+    def test_invalid_response_mode_raises(self):
+        from src.config_manager import ConfigManager
+        cm = ConfigManager()
+        cfg = self._base()
+        cfg['solver']['response_mode'] = 'quasi-static'
+        with self.assertRaises(ValueError):
+            cm.validate(cfg)
+
+    def test_1d_with_n_nodes_x_gt1_raises(self):
+        from src.config_manager import ConfigManager
+        cm = ConfigManager()
+        cfg = self._base()
+        cfg['solver']['type'] = '1d'
+        cfg['solver']['n_nodes_x'] = 5
+        with self.assertRaises(ValueError):
+            cm.validate(cfg)
+
+    def test_identity_mode_wrong_d_raises(self):
+        from src.config_manager import ConfigManager
+        cm = ConfigManager()
+        cfg = self._base()
+        cfg['dimension_reducer']['mode'] = 'identity'
+        cfg['dimension_reducer']['d'] = 2  # ≠ n_kl_terms_E=3
+        with self.assertRaises(ValueError):
+            cm.validate(cfg)
+
+    def test_d_exceeds_poly_basis_raises(self):
+        from src.config_manager import ConfigManager
+        cm = ConfigManager()
+        cfg = self._base()
+        cfg['dimension_reducer']['basis_type'] = 'polynomial'
+        cfg['dimension_reducer']['basis_order'] = 1  # 3 basis functions
+        cfg['dimension_reducer']['d'] = 10  # more than basis size
+        with self.assertRaises(ValueError):
+            cm.validate(cfg)
 
 
 if __name__ == '__main__':
