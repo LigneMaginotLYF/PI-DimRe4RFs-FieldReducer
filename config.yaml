@@ -1,6 +1,9 @@
 dataset:
   n_samples: 500
-  n_kl_terms_E: 5
+  # Number of field expansion terms (basis functions) for Young's modulus.
+  # Preferred key (new): n_terms_E
+  # Legacy key (deprecated, still supported): n_kl_terms_E
+  n_terms_E: 5
   seed: 42
   # Reuse an existing dataset instead of regenerating it.
   # Set to true and optionally override path_X / path_Y.
@@ -56,6 +59,26 @@ solver:
 random_field:
   covariance: "matern"
 
+  # Basis type for Phase-1 random field generation.
+  # Allowed values: "kl" | "dct"
+  # "kl"  (default): per-sample Matérn-KL eigenbasis.  The eigenbasis is
+  #        recomputed for each (nu, length_scale) draw, which provides exact
+  #        Matérn covariance structure but is slower and basis-dependent.
+  # "dct": fixed 2D DCT-II basis (deterministic, correlation-structure
+  #        independent).  Matérn-like structure is obtained by shaping the
+  #        variance of each DCT coefficient using an approximate 2D Matérn
+  #        spectral density (see DCTField docstring for formula details).
+  #        Sampling (nu, length_scale) reshapes coefficient variance without
+  #        changing basis functions, so two samples with the same coefficients
+  #        produce the same log-field regardless of the Matérn parameters used.
+  field_basis: "kl"
+
+  # Global amplitude multiplier on log(E).
+  # logE(x,z) = logE_std * sum_k a_k * psi_k(x,z)
+  # Decreasing logE_std makes GT settlements smoother / less variable.
+  # Alias: field_fluctuation_scale (both accepted; logE_std takes priority).
+  logE_std: 1.0
+
   # Smoothness parameter ν for the Matérn covariance kernel.
   # nu_sampling: if true, ν is drawn uniformly from nu_range each sample.
   # Set to false and provide nu_ref to use a fixed ν (required for a meaningful
@@ -78,9 +101,11 @@ dimension_reducer:
   d: 1
 
   # Basis used to reconstruct the material field from reduced coefficients.
-  # Allowed values: "polynomial" | "kl"
+  # Allowed values: "polynomial" | "kl" | "dct"
   # polynomial: multivariate polynomial in (x/L_x, z/L_z); requires d ≤ poly basis size.
   # kl         : truncated KL expansion using reference Matérn params (nu_ref, ls_ref).
+  # dct        : first d 2D DCT-II modes (same fixed basis as Phase-1 when
+  #              random_field.field_basis = "dct").
   basis_type: "polynomial"
 
   # Highest polynomial degree (only relevant for basis_type = "polynomial").

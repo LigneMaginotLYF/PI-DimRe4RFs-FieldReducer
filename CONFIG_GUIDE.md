@@ -11,14 +11,15 @@ Controls training-data generation (Phase 1).
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `n_samples` | int | 500 | Number of (KL-field, settlement) pairs to generate. |
-| `n_kl_terms_E` | int | 5 | Number of KL expansion terms for the Young's modulus field. Controls input dimensionality of the reducer (M: ξ_E ∈ ℝ^n_kl → ξ' ∈ ℝ^d). |
+| `n_samples` | int | 500 | Number of (field, settlement) pairs to generate. |
+| `n_terms_E` | int | 5 | Number of field expansion terms for the Young's modulus field. Controls input dimensionality of the reducer (M: ξ_E ∈ ℝ^n_terms → ξ' ∈ ℝ^d). **Preferred key.** |
+| `n_kl_terms_E` | int | *(alias)* | Legacy alias for `n_terms_E`. Still accepted but emits a `DeprecationWarning`; prefer `n_terms_E` for new configs. |
 | `seed` | int | 42 | Global random seed for reproducibility. |
 | `reuse` | bool | false | When `true`, loads `data/X_train.npy` / `data/Y_train.npy` instead of regenerating. |
-| `path_X` | str | `data/X_train.npy` | Custom load/save path for the KL-coefficient array (effective only when `reuse: true`). |
+| `path_X` | str | `data/X_train.npy` | Custom load/save path for the coefficient array (effective only when `reuse: true`). |
 | `path_Y` | str | `data/Y_train.npy` | Custom load/save path for the settlement-profile array. |
 
-**Interactions:** `reuse: true` requires that `n_kl_terms_E` matches the saved run.
+**Interactions:** `reuse: true` requires that `n_terms_E` matches the saved run.
 
 ---
 
@@ -74,19 +75,38 @@ Finite-difference solver settings.
 
 ## `random_field`
 
-Parameters for sampling Matérn KL random fields in Phase 1.
+Parameters for sampling random material fields in Phase 1.
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `covariance` | str | `"matern"` | Covariance kernel. Only `"matern"` is currently implemented. |
-| `nu_sampling` | bool | true | If `true`, the Matérn smoothness ν is drawn uniformly from `nu_range` for each sample. Set `false` for fixed ν (required for identity-mode verification). |
-| `nu_range` | [float, float] | [0.5, 2.5] | Uniform range for ν. Higher ν → smoother fields. |
-| `nu_ref` | float | 1.5 | Fixed ν used when `nu_sampling: false`. Also used as the KL-basis reference when `basis_type: "kl"`. |
-| `length_scale_sampling` | bool | true | If `true`, length scale ℓ is drawn from `length_scale_range` per sample. |
-| `length_scale_range` | [float, float] | [0.1, 0.5] | Uniform range for the correlation length scale. |
-| `length_scale_ref` | float | 0.3 | Fixed ℓ used when `length_scale_sampling: false`. Also used as the KL-basis reference when `basis_type: "kl"`. |
+| Parameter | Type | Default | Allowed | Description |
+|-----------|------|---------|---------|-------------|
+| `covariance` | str | `"matern"` | `"matern"` | Covariance kernel family. Only `"matern"` is currently implemented. |
+| `field_basis` | str | `"kl"` | `"kl"`, `"dct"` | **Basis used for Phase-1 field generation.** `"kl"` (default): per-sample Matérn-KL eigenbasis; recomputed for each (ν, ℓ) draw. `"dct"`: fixed 2D DCT-II basis; coefficient variance is shaped by an approximate 2D Matérn spectral density without changing the basis. See *DCT basis notes* below. |
+| `logE_std` | float | 1.0 | > 0 | Global amplitude multiplier on log(E). Decreasing this value makes GT settlements smoother / less variable between samples. Alias `field_fluctuation_scale` is also accepted; `logE_std` takes priority. |
+| `field_fluctuation_scale` | float | *(alias)* | > 0 | Alias for `logE_std`. Deprecated in favour of `logE_std`. |
+| `nu_sampling` | bool | true | — | If `true`, the Matérn smoothness ν is drawn uniformly from `nu_range` for each sample. Set `false` for fixed ν (required for identity-mode verification). For DCT basis, this reshapes coefficient variance without changing basis functions. |
+| `nu_range` | [float, float] | [0.5, 2.5] | — | Uniform range for ν. Higher ν → smoother fields. |
+| `nu_ref` | float | 1.5 | — | Fixed ν used when `nu_sampling: false`. Also used as the KL-basis reference when `basis_type: "kl"`. |
+| `length_scale_sampling` | bool | true | — | If `true`, length scale ℓ is drawn from `length_scale_range` per sample. |
+| `length_scale_range` | [float, float] | [0.1, 0.5] | — | Uniform range for the correlation length scale. |
+| `length_scale_ref` | float | 0.3 | — | Fixed ℓ used when `length_scale_sampling: false`. Also used as the KL-basis reference when `basis_type: "kl"`. |
 
-**For identity-mode verification**, set both `nu_sampling: false` and `length_scale_sampling: false` so that Phase-1 generation and Phase-2 reconstruction share the same KL basis (→ machine-precision equivalence).
+### DCT basis notes
+
+When `field_basis: "dct"`:
+- The 2D DCT-II basis modes are ordered by frequency magnitude (smoothest first).
+  The first `n_terms_E` modes are used.
+- The basis is **identical across all samples and all (ν, ℓ) draws**.
+  Two samples that happen to share the same coefficient vector `ξ_E` will
+  produce the *same* log-field regardless of which (ν, ℓ) was used to draw them.
+- Matérn-like spatial structure is achieved by sampling each coefficient
+  `a_k ~ N(0, σ_k²)` where `σ_k ∝ (2ν/ℓ² + ‖ω_k‖²)^{-(ν+1)/2}` (approximate
+  2D Matérn spectral density; documented in `src/field_generator.py` (`DCTField` class)).
+- The coefficient vector stored in `X_train` includes the Matérn-shaped variance,
+  so the mapping M: ξ_E → ξ' is trained on these scaled coefficients.
+- Set `dimension_reducer.basis_type: "dct"` in Phase 2 to use the same DCT
+  modes for LUT reconstruction (basis consistency).
+
+**For identity-mode verification**, set both `nu_sampling: false` and `length_scale_sampling: false` so that Phase-1 generation and Phase-2 reconstruction share the same KL/DCT basis parameters (→ machine-precision equivalence).
 
 ---
 
@@ -96,16 +116,16 @@ Settings for the dimension reducer M (Phase 3).
 
 | Parameter | Type | Default | Allowed | Description |
 |-----------|------|---------|---------|-------------|
-| `d` | int | 1 | 1 … n_kl | Reduced-space dimension. Number of scalar parameters that describe the low-dimensional material field. |
-| `basis_type` | str | `"polynomial"` | `"polynomial"`, `"kl"` | Basis used to reconstruct the material field from the reduced coefficients ξ'. `"polynomial"` = multivariate polynomial in (x/L_x, z/L_z). `"kl"` = truncated KL expansion with reference Matérn parameters. |
+| `d` | int | 1 | 1 … n_terms | Reduced-space dimension. Number of scalar parameters that describe the low-dimensional material field. |
+| `basis_type` | str | `"polynomial"` | `"polynomial"`, `"kl"`, `"dct"` | Basis used to reconstruct the material field from the reduced coefficients ξ'. `"polynomial"` = multivariate polynomial in (x/L_x, z/L_z). `"kl"` = truncated KL expansion with reference Matérn parameters. `"dct"` = first d 2D DCT-II modes consistent with Phase-1 when `random_field.field_basis = "dct"`. |
 | `basis_order` | int | 1 | 1 … 10 | Highest polynomial degree (only for `basis_type = "polynomial"`). Controls the number of available basis functions: order 1 → 3, order 2 → 6, order 3 → 10. `d` must not exceed this count. |
-| `mode` | str | `"learned"` | `"learned"`, `"identity"` | Mapping model mode. `"learned"` trains a NN or PCE. `"identity"` bypasses learning and routes ξ_E directly as ξ' (first d components); requires `d = n_kl_terms_E`. |
+| `mode` | str | `"learned"` | `"learned"`, `"identity"` | Mapping model mode. `"learned"` trains a NN or PCE. `"identity"` bypasses learning and routes ξ_E directly as ξ' (first d components); requires `d = n_terms_E`. |
 | `types` | list[str] | *(from surrogate.type)* | `["nn"]`, `["pce"]`, `["nn","pce"]` | Train multiple reducer types simultaneously. |
 
 **Invalid combinations:**
 - `basis_type: "polynomial"` and `d > n_poly_basis(basis_order)` → validation error.
-- `basis_type: "kl"` and `d > n_kl_terms_E` → validation error.
-- `mode: "identity"` and `d ≠ n_kl_terms_E` → validation error.
+- `basis_type: "kl"` or `"dct"` and `d > n_terms_E` → validation error.
+- `mode: "identity"` and `d ≠ n_terms_E` → validation error.
 
 ---
 

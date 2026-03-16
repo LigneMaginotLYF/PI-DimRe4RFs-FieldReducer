@@ -1,0 +1,43 @@
+# DCT-basis preset: fixed 2-D DCT-II field basis with Matern-shaped coefficient variance.
+#
+# Key differences from the default KL preset:
+#  - random_field.field_basis = "dct"   → Phase-1 uses fixed DCT modes (no per-sample
+#    eigenbasis recomputation).  Matérn-like covariance structure is approximated by
+#    shaping the per-mode coefficient variance with the 2-D Matérn spectral density.
+#  - dimension_reducer.basis_type = "dct" → Phase-2 LUT reconstruction uses the same
+#    first d DCT modes, ensuring Phase-1/Phase-2 basis consistency.
+#  - logE_std = 1.0  (default; decrease to produce smoother GT settlements).
+#
+# Usage:
+#   python train.py --preset presets/stage1_dct.yaml
+#
+# Smoke / fast run:
+#   python train.py --preset presets/stage1_dct.yaml \
+#       --n-samples 20 --surrogate-type pce --output-dir results/smoke_dct
+
+dataset:
+  n_terms_E: 5
+  n_samples: 500
+  seed: 42
+
+random_field:
+  field_basis: "dct"
+  logE_std: 1.0
+  nu_sampling: true
+  nu_range: [0.5, 2.5]
+  length_scale_sampling: true
+  length_scale_range: [0.1, 0.5]
+
+dimension_reducer:
+  d: 3
+  basis_type: "dct"
+  basis_order: 1
+  mode: "learned"
+
+surrogate:
+  type: "nn"
+  hidden_dim: 64
+  n_blocks: 3
+  epochs: 200
+  learning_rate: 1.0e-3
+  batch_size: 64

@@ -9,9 +9,10 @@ from pathlib import Path
 _ALLOWED = {
     'solver.type': {'1d', '2d'},
     'solver.response_mode': {'steady_state', 'transient'},
-    'dimension_reducer.basis_type': {'polynomial', 'kl'},
+    'dimension_reducer.basis_type': {'polynomial', 'kl', 'dct'},
     'dimension_reducer.mode': {'identity', 'learned'},
     'surrogate.type': {'nn', 'pce'},
+    'random_field.field_basis': {'kl', 'dct'},
 }
 
 # Minimum / maximum bounds for numeric config keys
@@ -23,7 +24,10 @@ _BOUNDS = {
     'solver.n_nodes_z': (2, None),
     'dataset.n_samples': (2, None),
     'dataset.n_kl_terms_E': (1, None),
+    'dataset.n_terms_E': (1, None),
     'solver.t_final': (1.0e-6, None),
+    'random_field.logE_std': (1.0e-6, None),
+    'random_field.field_fluctuation_scale': (1.0e-6, None),
 }
 
 
@@ -148,7 +152,8 @@ class ConfigManager:
         basis_type = _get('dimension_reducer.basis_type', 'polynomial')
         d = _get('dimension_reducer.d', 1)
         basis_order = _get('dimension_reducer.basis_order', 1)
-        n_kl = _get('dataset.n_kl_terms_E', 5)
+        # Support both n_terms_E (new) and n_kl_terms_E (legacy)
+        n_kl = _get('dataset.n_terms_E') or _get('dataset.n_kl_terms_E', 5)
         surr_types_list = _get('surrogate.types')
         if surr_types_list is None:
             surr_type_single = _get('surrogate.type', 'nn')
@@ -200,12 +205,13 @@ class ConfigManager:
                     "Reduce d or increase basis_order."
                 )
 
-        # KL basis: d must not exceed n_kl
-        if basis_type == 'kl' and d > n_kl:
+        # KL / DCT basis: d must not exceed n_terms
+        if basis_type in ('kl', 'dct') and d > n_kl:
+            n_terms_key = 'n_terms_E' if _get('dataset.n_terms_E') else 'n_kl_terms_E'
             errors.append(
-                f"dimension_reducer.basis_type='kl' and d={d} > "
-                f"n_kl_terms_E={n_kl}. "
-                "The reduced KL dimension d cannot exceed the number of KL terms."
+                f"dimension_reducer.basis_type={basis_type!r} and d={d} > "
+                f"dataset.{n_terms_key}={n_kl}. "
+                "The reduced dimension d cannot exceed the number of field terms."
             )
 
         if errors:

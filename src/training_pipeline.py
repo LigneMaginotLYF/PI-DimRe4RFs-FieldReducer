@@ -77,21 +77,54 @@ class TrainingPipeline:
             return BiotSolver2D(self.config)
 
     def _get_field_generator(self):
-        from src.field_generator import KLExpansionField
         sol = self.config.get('solver', {})
         dom = self.config.get('domain', {})
-        return KLExpansionField(
-            n_nodes_x=sol.get('n_nodes_x', 20),
-            n_nodes_z=sol.get('n_nodes_z', 20),
-            length_x=dom.get('length_x', 1.0),
-            length_z=dom.get('length_z', 1.0),
-        )
+        rf_cfg = self.config.get('random_field', {})
+        field_basis = rf_cfg.get('field_basis', 'kl')
+        if field_basis == 'dct':
+            from src.field_generator import DCTField
+            return DCTField(
+                n_nodes_x=sol.get('n_nodes_x', 20),
+                n_nodes_z=sol.get('n_nodes_z', 20),
+                length_x=dom.get('length_x', 1.0),
+                length_z=dom.get('length_z', 1.0),
+            )
+        else:
+            from src.field_generator import KLExpansionField
+            return KLExpansionField(
+                n_nodes_x=sol.get('n_nodes_x', 20),
+                n_nodes_z=sol.get('n_nodes_z', 20),
+                length_x=dom.get('length_x', 1.0),
+                length_z=dom.get('length_z', 1.0),
+            )
+
+    @staticmethod
+    def _resolve_n_terms(ds_cfg):
+        """Resolve number of field terms, supporting n_terms_E (new) and
+        n_kl_terms_E (legacy) config keys.  Emits a deprecation warning when
+        the old key is used and the new key is absent."""
+        import warnings
+        if 'n_terms_E' in ds_cfg:
+            return ds_cfg['n_terms_E']
+        if 'n_kl_terms_E' in ds_cfg:
+            warnings.warn(
+                "dataset.n_kl_terms_E is deprecated; use dataset.n_terms_E instead.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+            return ds_cfg['n_kl_terms_E']
+        return 5  # default
 
 
     def phase1_generate_dataset(self, n_samples=None, seed=None):
         """
-        Generate n_samples training samples with variable Matern KL fields.
-        Returns X_train (n_samples, n_kl_terms), Y_train (n_samples, n_x).
+        Generate n_samples training samples with random material fields.
+        Returns X_train (n_samples, n_terms), Y_train (n_samples, n_x).
+
+        Field basis is selected by random_field.field_basis:
+          "kl"  (default) – per-sample Matérn-KL eigenbasis (original behaviour).
+          "dct"           – fixed 2D DCT basis with Matérn-shaped coefficient
+                            variance; basis functions never change between samples.
 
         Respects config dataset.reuse flag: when True and saved arrays exist,
         loads them instead of recomputing.
@@ -108,11 +141,13 @@ class TrainingPipeline:
 
         n_samples = n_samples or ds_cfg.get('n_samples', 500)
         seed = seed if seed is not None else ds_cfg.get('seed', 42)
-        n_kl = ds_cfg.get('n_kl_terms_E', 5)
+        n_terms = self._resolve_n_terms(ds_cfg)
         E_ref = mat_cfg.get('E_ref', 10.0e6)
         k_h = mat_cfg.get('permeability_h', 1.0e-12)
         k_v = mat_cfg.get('permeability_v', 1.0e-12)
         n_x = sol_cfg.get('n_nodes_x', 20)
+        logE_std = rf_cfg.get('logE_std', rf_cfg.get('field_fluctuation_scale', 1.0))
+        field_basis = rf_cfg.get('field_basis', 'kl')
 
         # Resolve save paths (allow config override)
         x_path = ds_cfg.get('path_X', os.path.join(self.data_dir, 'X_train.npy'))
@@ -139,7 +174,7 @@ class TrainingPipeline:
         solver = self._get_solver()
         field_gen = self._get_field_generator()
 
-        X_train = np.zeros((n_samples, n_kl))
+        X_train = np.zeros((n_samples, n_terms))
         Y_train = np.zeros((n_samples, n_x))
 
         for i in range(n_samples):
@@ -147,8 +182,17 @@ class TrainingPipeline:
                 logger.info(f"Phase 1: sample {i}/{n_samples}")
             nu = rng.uniform(*nu_range) if nu_sampling else nu_ref
             length_scale = rng.uniform(*ls_range) if ls_sampling else ls_ref
-            xi_E = rng.standard_normal(n_kl)
-            E_field = field_gen.generate_field(xi_E, nu, length_scale, n_terms=n_kl, E_ref=E_ref)
+            if field_basis == 'dct':
+                xi_E, E_field = field_gen.generate_field(
+                    rng, nu, length_scale,
+                    n_terms=n_terms, E_ref=E_ref, logE_std=logE_std,
+                )
+            else:
+                xi_E = rng.standard_normal(n_terms)
+                E_field = field_gen.generate_field(
+                    xi_E, nu, length_scale,
+                    n_terms=n_terms, E_ref=E_ref, logE_std=logE_std,
+                )
             Y = solver.run(E_field, k_h, k_v)
             X_train[i] = xi_E
             Y_train[i] = Y
@@ -339,7 +383,7 @@ class TrainingPipeline:
         reducer_mode = red_cfg.get('mode', 'learned')
         if reducer_mode == 'identity':
             logger.info("Phase 3: identity mode -- using trivial identity reducer")
-            reducer = _IdentityReducer(input_dim=input_dim, output_dim=input_dim)
+            reducer = _IdentityReducer(input_dim=input_dim, output_dim=output_dim)
             # Save reducer
             import pickle
             with open(os.path.join(self.models_dir, 'dimension_reducer_identity.pkl'), 'wb') as f:
@@ -533,7 +577,7 @@ class TrainingPipeline:
         rf_cfg = self.config.get('random_field', {})
         ds_cfg = self.config.get('dataset', {})
         mat_cfg = self.config.get('material', {})
-        n_kl = ds_cfg.get('n_kl_terms_E', 5)
+        n_terms = self._resolve_n_terms(ds_cfg)
         E_ref = mat_cfg.get('E_ref', 10.0e6)
         k_h = mat_cfg.get('permeability_h', 1.0e-12)
         k_v = mat_cfg.get('permeability_v', 1.0e-12)
@@ -541,13 +585,15 @@ class TrainingPipeline:
         ls_sampling = rf_cfg.get('length_scale_sampling', True)
         nu_ref = rf_cfg.get('nu_ref', 1.5)
         ls_ref = rf_cfg.get('length_scale_ref', 0.3)
+        logE_std = rf_cfg.get('logE_std', rf_cfg.get('field_fluctuation_scale', 1.0))
+        field_basis = rf_cfg.get('field_basis', 'kl')
 
         if nu_sampling or ls_sampling:
             logger.warning(
                 "Identity check: nu_sampling or length_scale_sampling is True. "
                 "For exact identity (machine-precision error), set both to false "
                 "so Phase-1 generation and Phase-2 reconstruction share the same "
-                "KL basis.  Reported errors will include KL-basis mismatch."
+                "basis.  Reported errors will include basis mismatch."
             )
 
         field_gen = self._get_field_generator()
@@ -567,9 +613,16 @@ class TrainingPipeline:
         for i in range(n):
             nu = rng.uniform(*nu_range) if nu_sampling else nu_ref
             length_scale = rng.uniform(*ls_range) if ls_sampling else ls_ref
-            E_field = field_gen.generate_field(
-                X_test[i], nu, length_scale, n_terms=n_kl, E_ref=E_ref
-            )
+            if field_basis == 'dct':
+                # DCT: X_test[i] are the stored coefficients; reconstruct directly.
+                E_field = field_gen.reconstruct_from_coefficients(
+                    X_test[i], E_ref=E_ref, logE_std=logE_std
+                )
+            else:
+                E_field = field_gen.generate_field(
+                    X_test[i], nu, length_scale,
+                    n_terms=n_terms, E_ref=E_ref, logE_std=logE_std,
+                )
             Y_direct[i] = solver.run(E_field, k_h, k_v)
 
         metrics_direct = Validation.compute_metrics(Y_direct, Y_test)
@@ -610,9 +663,11 @@ class TrainingPipeline:
         field_gen = self._get_field_generator()
         rf_cfg = self.config.get('random_field', {})
         ds_cfg = self.config.get('dataset', {})
-        n_kl = ds_cfg.get('n_kl_terms_E', 5)
+        n_terms = self._resolve_n_terms(ds_cfg)
         nu_range = rf_cfg.get('nu_range', [0.5, 2.5])
         ls_range = rf_cfg.get('length_scale_range', [0.1, 0.5])
+        field_basis = rf_cfg.get('field_basis', 'kl')
+        logE_std = rf_cfg.get('logE_std', rf_cfg.get('field_fluctuation_scale', 1.0))
 
         n = min(n_samples, len(X_test))
         seed = self.config.get('dataset', {}).get('seed', 42)
@@ -630,9 +685,15 @@ class TrainingPipeline:
             ls_ref = rf_cfg.get('length_scale_ref', 0.3)
             nu = rng.uniform(*nu_range) if nu_sampling else nu_ref
             length_scale = rng.uniform(*ls_range) if ls_sampling else ls_ref
-            E_field = field_gen.generate_field(
-                X_test[i], nu, length_scale, n_terms=n_kl, E_ref=E_ref
-            )
+            if field_basis == 'dct':
+                E_field = field_gen.reconstruct_from_coefficients(
+                    X_test[i], E_ref=E_ref, logE_std=logE_std
+                )
+            else:
+                E_field = field_gen.generate_field(
+                    X_test[i], nu, length_scale,
+                    n_terms=n_terms, E_ref=E_ref, logE_std=logE_std,
+                )
             E_fields.append(E_field)
             # Reconstruct reduced E field using basis functions (d-dimensional xi')
             E_red_field = reduced_lut._reconstruct_field(xi_prime_pred[i])
