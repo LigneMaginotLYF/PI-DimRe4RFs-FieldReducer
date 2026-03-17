@@ -120,17 +120,24 @@ class TrainingPipeline:
         """
         Compute collocation node indices from config.
 
-        Uses ``collocation.positions`` (physical x-coordinates) when provided;
-        otherwise defaults to all n_nodes_x nodes.
+        Supports three mutually exclusive specification methods (listed in
+        priority order):
+
+        1. ``indices`` – explicit list of integer node indices.
+        2. ``positions`` – physical x-coordinates mapped to nearest nodes.
+        3. ``n_points`` – number of uniformly-spaced nodes (deterministic).
+
+        If none of the above is specified the function defaults to all
+        ``n_nodes_x`` nodes.
 
         Phase-specific overrides are supported for independent configuration of
         Phase-2 evaluation markers and Phase-3 training loss:
 
-          - ``phase='phase2'``: reads ``collocation_phase2.positions`` first;
-            falls back to ``collocation.positions``, then to all nodes.
-          - ``phase='phase3'``: reads ``collocation_phase3.positions`` first;
-            falls back to ``collocation.positions``, then to all nodes.
-          - ``phase=None``: reads ``collocation.positions`` only.
+          - ``phase='phase2'``: reads ``collocation_phase2.*`` first;
+            falls back to ``collocation.*``, then to all nodes.
+          - ``phase='phase3'``: reads ``collocation_phase3.*`` first;
+            falls back to ``collocation.*``, then to all nodes.
+          - ``phase=None``: reads ``collocation.*`` only.
 
         Args:
             config      : Full pipeline config dict.
@@ -142,45 +149,61 @@ class TrainingPipeline:
         Returns:
             colloc_idx  : 1-D numpy int array of node indices, sorted ascending.
         """
-        positions_cfg = None
-        if phase == 'phase2':
-            phase_cfg = config.get('collocation_phase2') or {}
-            positions_cfg = phase_cfg.get('positions', None)
-        elif phase == 'phase3':
-            phase_cfg = config.get('collocation_phase3') or {}
-            positions_cfg = phase_cfg.get('positions', None)
 
-        # Fallback to common collocation section when phase-specific is absent
-        if positions_cfg is None:
-            collocation_cfg = config.get('collocation') or {}
-            positions_cfg = collocation_cfg.get('positions', None)
+        def _get_spec(cfg):
+            """Return (spec_type, spec_value) from a collocation config dict."""
+            indices = cfg.get('indices', None)
+            if indices is not None:
+                return 'indices', indices
+            positions = cfg.get('positions', None)
+            if positions is not None:
+                return 'positions', positions
+            n_pts = cfg.get('n_points', None)
+            if n_pts is not None:
+                return 'n_points', n_pts
+            return None, None
 
-        if positions_cfg is not None:
-            positions = np.asarray(positions_cfg, dtype=float)
-            # Map each physical position to the nearest node index.
-            # The grid is uniform so searchsorted gives an O(log n) candidate,
-            # but we still clamp and compare both neighbours for correctness.
+        spec_type, spec_value = None, None
+        if phase in ('phase2', 'phase3'):
+            phase_cfg = config.get(f'collocation_{phase}') or {}
+            spec_type, spec_value = _get_spec(phase_cfg)
+        if spec_type is None:
+            colloc_cfg = config.get('collocation') or {}
+            spec_type, spec_value = _get_spec(colloc_cfg)
+
+        phase_tag = phase or 'colloc'
+
+        if spec_type == 'indices':
+            colloc_idx = np.unique(
+                np.clip(np.asarray(spec_value, dtype=int), 0, n_nodes_x - 1)
+            )
+            logger.info(f"{phase_tag} colloc nodes: N={len(colloc_idx)} (explicit indices)")
+        elif spec_type == 'positions':
+            positions = np.asarray(spec_value, dtype=float)
             x_grid = np.linspace(0.0, length_x, n_nodes_x)
-            dx = length_x / max(n_nodes_x - 1, 1)
             raw = np.searchsorted(x_grid, positions)
             raw = np.clip(raw, 0, n_nodes_x - 1)
-            # Prefer left neighbour when equidistant or closer
             left = np.clip(raw - 1, 0, n_nodes_x - 1)
-            use_left = np.abs(x_grid[left] - positions) <= np.abs(x_grid[raw] - positions)
-            indices = np.where(use_left, left, raw).astype(int)
-            colloc_idx = np.unique(indices)  # sorted, deduplicated
-            phase_label = f" (phase={phase})" if phase else ""
+            use_left = (
+                np.abs(x_grid[left] - positions) <= np.abs(x_grid[raw] - positions)
+            )
+            colloc_idx = np.unique(np.where(use_left, left, raw).astype(int))
             logger.info(
-                f"Collocation{phase_label}: using {len(colloc_idx)} node indices "
-                f"from {len(positions)} configured positions: {colloc_idx.tolist()}"
+                f"{phase_tag} colloc nodes: N={len(colloc_idx)} "
+                f"(from {len(positions)} positions)"
+            )
+        elif spec_type == 'n_points':
+            n_pts = max(1, min(int(spec_value), n_nodes_x))
+            colloc_idx = np.unique(
+                np.round(np.linspace(0, n_nodes_x - 1, n_pts)).astype(int)
+            )
+            logger.info(
+                f"{phase_tag} colloc nodes: N={len(colloc_idx)} "
+                f"(uniform, n_points={n_pts})"
             )
         else:
             colloc_idx = np.arange(n_nodes_x, dtype=int)
-            phase_label = f" (phase={phase})" if phase else ""
-            logger.info(
-                f"Collocation{phase_label}: no positions configured – "
-                f"using all {n_nodes_x} nodes"
-            )
+            logger.info(f"{phase_tag} colloc nodes: N={n_nodes_x} (all nodes, default)")
         return colloc_idx
 
 
@@ -249,6 +272,16 @@ class TrainingPipeline:
         X_train = np.zeros((n_samples, n_terms))
         Y_train = np.zeros((n_samples, n_x))
 
+        # Trend in log-E space (optional, both DCT and KL paths)
+        trend_cfg = rf_cfg.get('trend') or {}
+        trend_enabled = bool(trend_cfg.get('enabled', False))
+        if trend_enabled:
+            logger.info(
+                f"Phase 1: trend enabled "
+                f"(order_x={trend_cfg.get('order_x',1)}, "
+                f"order_z={trend_cfg.get('order_z',1)})"
+            )
+
         if e_ref_sampling and field_basis == 'dct':
             logger.info(
                 f"Phase 1: E_ref_sampling=True, factor_range={e_ref_factor_range}, "
@@ -267,12 +300,15 @@ class TrainingPipeline:
                     rng, nu, length_scale,
                     n_terms=n_terms, E_ref=E_ref, logE_std=logE_std,
                     E_ref_factor=factor,
+                    trend_cfg=trend_cfg if trend_enabled else None,
                 )
             else:
                 xi_E = rng.standard_normal(n_terms)
                 E_field = field_gen.generate_field(
                     xi_E, nu, length_scale,
                     n_terms=n_terms, E_ref=E_ref, logE_std=logE_std,
+                    rng=rng,
+                    trend_cfg=trend_cfg if trend_enabled else None,
                 )
             Y = solver.run(E_field, k_h, k_v)
             X_train[i] = xi_E
@@ -311,8 +347,14 @@ class TrainingPipeline:
         val_cfg = self.config.get('validation') or {}
         seed = seed if seed is not None else ds_cfg.get('seed', 42)
 
-        # Support a list of types for simultaneous training
-        surrogate_types = surr_cfg.get('types', None)
+        # Support a list of types for simultaneous training;
+        # phase2.surrogate_type / phase2.surrogate_types take precedence
+        phase2_cfg = self.config.get('phase2') or {}
+        surrogate_types = phase2_cfg.get('surrogate_types', None)
+        if surrogate_types is None and phase2_cfg.get('surrogate_type'):
+            surrogate_types = [phase2_cfg['surrogate_type']]
+        if surrogate_types is None:
+            surrogate_types = surr_cfg.get('types', None)
         if surrogate_types is None:
             surrogate_types = [surr_cfg.get('type', 'nn')]
         val_fraction = val_cfg.get('val_fraction', 0.2)
@@ -453,11 +495,16 @@ class TrainingPipeline:
             f"({len(colloc_idx)} indices) to {lut_output_dir}"
         )
 
-        # Support a list of types
-        reducer_types = red_cfg.get('types', None)
+        # Support a list of types;
+        # phase3.reducer_type / phase3.reducer_types take precedence
+        phase3_cfg = self.config.get('phase3') or {}
+        reducer_types = phase3_cfg.get('reducer_types', None)
+        if reducer_types is None and phase3_cfg.get('reducer_type'):
+            reducer_types = [phase3_cfg['reducer_type']]
         if reducer_types is None:
-            surrogate_type = surr_cfg.get('type', 'nn')
-            reducer_types = [surrogate_type]
+            reducer_types = red_cfg.get('types', None)
+        if reducer_types is None:
+            reducer_types = [surr_cfg.get('type', 'nn')]
 
         train_frac = val_cfg.get('train_fraction', 0.6)
         val_frac = val_cfg.get('val_fraction', 0.2)
@@ -559,10 +606,14 @@ class TrainingPipeline:
             )
         else:
             from src.mapping_learner_pce import PolynomialChaosExpansion
-            # PCE degree comes from dimension_reducer.basis_order (authoritative).
-            # surrogate.basis_order is kept as a legacy fallback only.
+            # PCE degree: phase3.pce.order > dimension_reducer.basis_order > surrogate.basis_order
+            phase3_pce_cfg = (self.config.get('phase3') or {}).get('pce') or {}
+            degree = phase3_pce_cfg.get(
+                'order',
+                red_cfg.get('basis_order', surr_cfg.get('basis_order', 3)),
+            )
             reducer = PolynomialChaosExpansion(
-                degree=red_cfg.get('basis_order', surr_cfg.get('basis_order', 3)),
+                degree=degree,
                 n_inputs=input_dim,
                 n_outputs=output_dim,
             )

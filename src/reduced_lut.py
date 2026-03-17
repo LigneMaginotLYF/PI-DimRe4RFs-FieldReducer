@@ -338,7 +338,9 @@ class ReducedLUT:
             self.surrogate = model
 
         elif surrogate_type == 'pce':
-            degree = surrogate_cfg.get('basis_order', 3)
+            # PCE degree: phase2.pce.order > surrogate.basis_order
+            phase2_pce_cfg = (self.config.get('phase2') or {}).get('pce') or {}
+            degree = phase2_pce_cfg.get('order', surrogate_cfg.get('basis_order', 3))
             model = PolynomialChaosExpansion(
                 degree=degree, n_inputs=self.d, n_outputs=output_dim
             )
