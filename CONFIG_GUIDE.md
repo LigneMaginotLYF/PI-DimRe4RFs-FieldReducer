@@ -123,6 +123,44 @@ When `E_ref_sampling: true` (DCT basis only):
 
 ---
 
+### `random_field.trend` — nonstationary spatial trend (Phase 1)
+
+Optional polynomial trend added to log(E) during Phase-1 sample generation.
+The trend is **separable**: independent polynomial terms in x and z with no
+cross-product terms.  Coefficients are sampled per-sample from a uniform distribution.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `enabled` | bool | `false` | Master switch. When `false`, no trend is applied (returns zero contribution). |
+| `order_x` | int | 1 | Highest polynomial power for the x direction. Recommended ≤ 2. |
+| `order_z` | int | 1 | Highest polynomial power for the z direction. Recommended ≤ 2. |
+| `include_const` | bool | `false` | Whether to add a constant (order-0) term. Usually `false` because the DC DCT coefficient / KL mean already controls the spatial mean. |
+| `coeff_bounds_x` | list[[float,float]] | `[[-1,1],…]` | Per-power coefficient bounds for x. One `[min, max]` pair per power `1..order_x`. Defaults to `[-1.0, 1.0]` for unspecified terms. |
+| `coeff_bounds_z` | list[[float,float]] | `[[-1,1],…]` | Per-power coefficient bounds for z. Same structure as `coeff_bounds_x`. |
+| `coeff_bound_const` | [float,float] | `[-1.0, 1.0]` | Bounds for the constant term (only relevant when `include_const: true`). |
+
+**Example** — linear-in-z tilt with mild x gradient:
+
+```yaml
+random_field:
+  trend:
+    enabled: true
+    order_x: 1
+    order_z: 2
+    include_const: false
+    coeff_bounds_x:
+      - [-0.3, 0.3]   # coefficient for x^1
+    coeff_bounds_z:
+      - [-0.5, 0.5]   # coefficient for z^1
+      - [-0.2, 0.2]   # coefficient for z^2
+```
+
+> **Note**: The trend is applied in **log-E space** before exponentiation, so it
+> does not break the positivity constraint on E.  Large trend coefficients can
+> create strong spatial gradients; keep |coeff| ≪ `logE_std` for moderate nonstationarity.
+
+---
+
 ## `dimension_reducer`
 
 Settings for the dimension reducer M (Phase 3).
@@ -131,7 +169,7 @@ Settings for the dimension reducer M (Phase 3).
 |-----------|------|---------|---------|-------------|
 | `d` | int | 1 | 1 … n_terms | Reduced-space dimension. Number of scalar parameters that describe the low-dimensional material field. |
 | `basis_type` | str | `"polynomial"` | `"polynomial"`, `"kl"`, `"dct"` | Basis used to reconstruct the material field from the reduced coefficients ξ'. `"polynomial"` = multivariate polynomial in (x/L_x, z/L_z). `"kl"` = truncated KL expansion with reference Matérn parameters. `"dct"` = first d 2D DCT-II modes consistent with Phase-1 when `random_field.field_basis = "dct"`. |
-| `basis_order` | int | 1 | 1 … 10 | Highest polynomial degree (only for `basis_type = "polynomial"`). Controls the number of available basis functions: order 1 → 3, order 2 → 6, order 3 → 10. `d` must not exceed this count. |
+| `basis_order` | int | 1 | ≥ 1 | Highest polynomial degree (only for `basis_type = "polynomial"`). Any positive integer. Basis size = (order+1)(order+2)/2: order 1 → 3, order 2 → 6, order 3 → 10, order 4 → 15. `d` must not exceed this count. |
 | `mode` | str | `"learned"` | `"learned"`, `"identity"` | Mapping model mode. `"learned"` trains a NN or PCE. `"identity"` bypasses learning and routes ξ_E directly as ξ' (first d components); requires `d = n_terms_E`. |
 | `types` | list[str] | *(from surrogate.type)* | `["nn"]`, `["pce"]`, `["nn","pce"]` | Train multiple reducer types simultaneously. |
 
@@ -237,6 +275,107 @@ collocation:
 With `n_nodes_x: 20` and `length_x: 1.0` this selects nodes 0, 5, 10, 14, 19
 (nearest grid points), resulting in 5-point Phase-3 loss and 5 green circles
 in the settlement comparison plots.
+
+---
+
+## `collocation_phase2` / `collocation_phase3`
+
+Phase-specific collocation overrides that allow **independent collocation
+configuration** for Phase-2 evaluation and Phase-3 training.  The lookup
+order for each phase is:
+
+1. Phase-specific section (`collocation_phase2` or `collocation_phase3`)
+2. Legacy `collocation` section
+3. Default: all `n_nodes_x` nodes
+
+Each section supports three mutually exclusive specification methods (highest priority first):
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `indices` | list[int] | Explicit integer node indices (0-based).  Allows fully custom, uneven spacing.  Values are clipped to `[0, n_nodes_x-1]`. |
+| `positions` | list[float] | Physical x-coordinates mapped to nearest node indices.  Convenient when you know the physical positions of your sensors/benchmarks. |
+| `n_points` | int | Number of uniformly-spaced nodes chosen deterministically (includes both endpoints).  Simplest way to request a sparse set with guaranteed coverage. |
+
+### Phase-2 collocation (`collocation_phase2`)
+
+Used for evaluation markers in Phase-2 surrogate diagnostics.  Dense coverage
+is recommended (the default is all nodes):
+
+```yaml
+collocation_phase2:
+  # Omit any key to default to all nodes (densest possible)
+```
+
+### Phase-3 collocation (`collocation_phase3`)
+
+Controls which x-nodes enter the Phase-3 reducer training loss.
+Sparser collocation can improve generalisation and reduce training cost:
+
+```yaml
+# 5 uniformly-spaced nodes including endpoints [0, 5, 10, 14, 19] for n_nodes_x=20
+collocation_phase3:
+  n_points: 5
+
+# Manually specified uneven indices (e.g. denser near boundaries)
+# collocation_phase3:
+#   indices: [0, 1, 5, 14, 18, 19]
+
+# Physical positions (useful when matching sensor placement)
+# collocation_phase3:
+#   positions: [0.0, 0.2, 0.5, 0.8, 1.0]
+```
+
+> **Tip**: Keep `collocation_phase2` dense (all nodes) for full diagnostic coverage,
+> and use `collocation_phase3` to constrain the Phase-3 training loss to a
+> physically meaningful sparse set (e.g. simulated sensor locations).
+
+---
+
+## `phase2` — Phase-2 model configuration
+
+Overrides for the Phase-2 LUT forward surrogate (ξ' → Y).
+**Phase-2 and Phase-3 model selections are completely independent.**
+These keys take precedence over `surrogate.type` / `surrogate.types`.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `surrogate_type` | str | *(from `surrogate.type`)* | Surrogate type for Phase 2. `"nn"` or `"pce"`. |
+| `surrogate_types` | list[str] | *(from `surrogate.types`)* | Train multiple surrogate types simultaneously. |
+| `pce.order` | int | 3 | PCE polynomial degree for Phase-2 (only when `surrogate_type = "pce"`). |
+
+**Example** — use NN for Phase 2, PCE for Phase 3:
+
+```yaml
+phase2:
+  surrogate_type: "nn"
+
+phase3:
+  reducer_type: "pce"
+  pce:
+    order: 4
+```
+
+---
+
+## `phase3` — Phase-3 model configuration
+
+Overrides for the Phase-3 dimension reducer (ξ_E → ξ').
+**Phase-2 and Phase-3 model selections are completely independent.**
+These keys take precedence over `dimension_reducer.types` / `surrogate.type`.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `reducer_type` | str | *(from `surrogate.type`)* | Reducer type for Phase 3. `"nn"` or `"pce"`. |
+| `reducer_types` | list[str] | *(from `dimension_reducer.types`)* | Train multiple reducer types simultaneously. |
+| `pce.order` | int | 3 | PCE polynomial degree for Phase-3 (only when `reducer_type = "pce"`). |
+
+> **Why separate?**  Phase-2 learns a forward map from low-dimensional ξ' to
+> settlement profiles — typically a smooth, well-conditioned regression for which
+> a small NN or moderate-order PCE works well.  Phase-3 learns an *inverse*-like
+> mapping from high-dimensional ξ_E to ξ', which may require very different
+> model capacity.  Coupling the two types via a single `surrogate.type` key hides
+> this distinction and can cause Phase-3 to silently use PCE (very slow) when
+> only Phase-2 was intended to be PCE.
 
 ---
 
