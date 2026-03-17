@@ -104,6 +104,29 @@ random_field:
   E_ref_sampling: false
   E_ref_factor_range: [0.5, 1.5]
 
+  # Optional nonstationary trend added to log(E) in Phase-1 sample generation.
+  # The trend is separable: independent polynomial terms in x and z directions
+  # (no cross-product terms).  Coefficients are drawn per-sample from Uniform(bounds).
+  trend:
+    enabled: false
+
+    # Highest polynomial power for x and z directions (≤ 2 recommended).
+    order_x: 2
+    order_z: 2
+
+    # Whether to add a constant (order-0) term.  Usually false because the DC
+    # DCT coefficient / KL mean already controls the spatial mean.
+    include_const: false
+
+    # Coefficient bounds per power (one [min, max] pair per exponent 1..order).
+    # Defaults to [-1.0, 1.0] for any unspecified term.
+    # coeff_bounds_x:
+    #   - [-0.5, 0.5]   # coefficient for x^1
+    #   - [-0.3, 0.3]   # coefficient for x^2
+    # coeff_bounds_z:
+    #   - [-0.5, 0.5]   # coefficient for z^1
+    #   - [-0.3, 0.3]   # coefficient for z^2
+
 dimension_reducer:
   # Reduced-space dimension.
   # How many scalar parameters describe the low-dimensional material field.
@@ -119,10 +142,11 @@ dimension_reducer:
   basis_type: "polynomial"
 
   # Highest polynomial degree (only relevant for basis_type = "polynomial").
-  # Allowed values: 1 | 2 | 3 (higher orders add more basis functions)
+  # Any positive integer (≥ 1) is accepted.  Basis size = (order+1)(order+2)/2.
   # Order 1: 3 functions {1, x, z}
   # Order 2: 6 functions {1, x, z, x², xz, z²}
   # Order 3: 10 functions {… + x³, x²z, xz², z³}
+  # Order 4: 15 functions (adds x⁴, x³z, x²z², xz³, z⁴)
   basis_order: 1
 
   # Mapping model mode.
@@ -199,6 +223,53 @@ collocation:
   # Optionally specify explicit physical x-positions for collocation markers
   # in settlement comparison plots.  Leave commented to use all n_nodes_x positions.
   # positions: [0.0, 0.25, 0.5, 0.75, 1.0]
+
+# Phase-2-specific collocation override.
+# Evaluated before the legacy `collocation` section.  When absent the
+# pipeline falls back to `collocation.*` then to all nodes.
+# Phase 2 collocation controls evaluation markers and diagnostics; dense
+# coverage is recommended.
+collocation_phase2:
+  # All nodes by default (omit n_points/positions/indices to use all nodes).
+  # n_points: 20       # uniform nodes (includes endpoints)
+  # positions: [...]   # explicit physical x-positions
+  # indices: [...]     # explicit integer node indices
+
+# Phase-3-specific collocation override.
+# Controls which x-nodes are included in the Phase-3 reducer training loss.
+# Sparser collocation reduces training cost and may improve generalisation.
+collocation_phase3:
+  # Example: 5 uniformly-spaced nodes including both endpoints.
+  n_points: 5
+  # Alternatively use explicit positions or integer indices for uneven spacing:
+  # positions: [0.0, 0.2, 0.5, 0.8, 1.0]
+  # indices: [0, 4, 9, 14, 19]
+
+# Phase-2 model configuration (Phase-2 LUT surrogate: ξ' → Y).
+# These keys take precedence over `surrogate.type` / `surrogate.types`.
+# Phase-2 and Phase-3 model selections are completely independent.
+phase2:
+  # Surrogate type for the Phase-2 LUT forward surrogate.
+  # Allowed: "nn" | "pce"  (or set surrogate_types: ["nn","pce"] for both).
+  surrogate_type: "nn"
+  # surrogate_types: ["nn", "pce"]
+
+  # PCE hyperparameters specific to Phase 2 (only used when surrogate_type = "pce").
+  pce:
+    order: 3   # polynomial chaos expansion degree
+
+# Phase-3 model configuration (Phase-3 dimension reducer: ξ_E → ξ').
+# These keys take precedence over `dimension_reducer.types` / `surrogate.type`.
+# Phase-2 and Phase-3 model selections are completely independent.
+phase3:
+  # Reducer type for Phase-3 dimension mapping.
+  # Allowed: "nn" | "pce"  (or set reducer_types: ["nn","pce"] for both).
+  reducer_type: "nn"
+  # reducer_types: ["nn", "pce"]
+
+  # PCE hyperparameters specific to Phase 3 (only used when reducer_type = "pce").
+  pce:
+    order: 3   # polynomial chaos expansion degree
 
 validation:
   train_fraction: 0.6

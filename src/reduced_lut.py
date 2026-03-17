@@ -132,26 +132,24 @@ class ReducedLUT:
         x_norm = X / length_x
         z_norm = Z / length_z
 
-        basis_funcs = [np.ones_like(X)]
-        if self.basis_order >= 1:
-            basis_funcs.append(x_norm)
-            basis_funcs.append(z_norm)
-        if self.basis_order >= 2:
-            basis_funcs.append(x_norm ** 2)
-            basis_funcs.append(x_norm * z_norm)
-            basis_funcs.append(z_norm ** 2)
-        if self.basis_order >= 3:
-            basis_funcs.append(x_norm ** 3)
-            basis_funcs.append(x_norm ** 2 * z_norm)
-            basis_funcs.append(x_norm * z_norm ** 2)
-            basis_funcs.append(z_norm ** 3)
+        # Build the full 2D monomial basis for all x^i * z^j with i+j <= basis_order.
+        # Monomials are ordered by total degree first, then by increasing z-power within
+        # each degree (preserving the ordering used for basis_order <= 3).
+        # Basis size = (basis_order + 1) * (basis_order + 2) // 2.
+        basis_funcs = []
+        for total_deg in range(0, self.basis_order + 1):
+            for j in range(0, total_deg + 1):
+                i = total_deg - j
+                basis_funcs.append((x_norm ** i) * (z_norm ** j))
 
         # Validate that d doesn't exceed available basis functions for this order
         n_available = len(basis_funcs)
         if len(xi_prime) > n_available:
             raise ValueError(
                 f"d={len(xi_prime)} exceeds the {n_available} basis functions available for "
-                f"basis_order={self.basis_order}. Reduce d or increase basis_order."
+                f"basis_order={self.basis_order}. "
+                f"For order p the basis size is (p+1)(p+2)/2 "
+                f"(e.g. order 4 → 15 terms). Reduce d or increase basis_order."
             )
 
         basis_funcs = basis_funcs[:len(xi_prime)]

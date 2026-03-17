@@ -18,7 +18,7 @@ _ALLOWED = {
 # Minimum / maximum bounds for numeric config keys
 _BOUNDS = {
     'dimension_reducer.d': (1, None),
-    'dimension_reducer.basis_order': (1, 10),
+    'dimension_reducer.basis_order': (1, None),
     'reduced_lut.n_grid_points': (10, None),
     'solver.n_nodes_x': (1, None),
     'solver.n_nodes_z': (2, None),

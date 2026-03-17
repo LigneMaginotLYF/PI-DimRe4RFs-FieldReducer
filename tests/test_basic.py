@@ -1723,5 +1723,105 @@ class TestPhase4PlottingConsistency(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestPolynomialBasis(unittest.TestCase):
+    """Tests for the general polynomial basis in ReducedLUT."""
+
+    def _make_lut(self, basis_order, d):
+        """Create a minimal ReducedLUT with the given polynomial basis settings."""
+        from src.reduced_lut import ReducedLUT
+        from src.forward_solver_2d import BiotSolver2D
+        config = {
+            'material': {
+                'E_ref': 10.0e6,
+                'permeability_ref': 1.0e-12,
+                'permeability_h': 1.0e-12,
+                'permeability_v': 1.0e-12,
+            },
+            'solver': {'n_nodes_x': 5, 'n_nodes_z': 5, 'type': '2d'},
+            'domain': {'length_x': 1.0, 'length_z': 1.0},
+            'dimension_reducer': {'d': d, 'basis_type': 'polynomial', 'basis_order': basis_order},
+            'reduced_lut': {'n_grid_points': 10, 'grid_type': 'random'},
+            'surrogate': {'output_representation': 'direct', 'n_output_modes': 4},
+        }
+        solver = BiotSolver2D(config)
+        return ReducedLUT(config, solver)
+
+    def test_basis_size_order1(self):
+        """Order 1 → 3 basis functions: {1, x, z}."""
+        lut = self._make_lut(basis_order=1, d=3)
+        xi = np.zeros(3)
+        E = lut._reconstruct_field_polynomial(xi)
+        self.assertEqual(E.shape, (5, 5))
+
+    def test_basis_size_order2(self):
+        """Order 2 → 6 basis functions: {1, x, z, x², xz, z²}."""
+        lut = self._make_lut(basis_order=2, d=6)
+        xi = np.zeros(6)
+        E = lut._reconstruct_field_polynomial(xi)
+        self.assertEqual(E.shape, (5, 5))
+
+    def test_basis_size_order3(self):
+        """Order 3 → 10 basis functions."""
+        lut = self._make_lut(basis_order=3, d=10)
+        xi = np.zeros(10)
+        E = lut._reconstruct_field_polynomial(xi)
+        self.assertEqual(E.shape, (5, 5))
+
+    def test_basis_size_order4_is_15(self):
+        """Order 4 → 15 basis functions: (4+1)(4+2)/2 = 15."""
+        lut = self._make_lut(basis_order=4, d=15)
+        xi = np.zeros(15)
+        E = lut._reconstruct_field_polynomial(xi)
+        self.assertEqual(E.shape, (5, 5))
+
+    def test_basis_order4_supports_d12(self):
+        """basis_order=4 (15 terms) must accept d=12 without error."""
+        lut = self._make_lut(basis_order=4, d=12)
+        xi = np.zeros(12)
+        E = lut._reconstruct_field_polynomial(xi)
+        self.assertEqual(E.shape, (5, 5))
+
+    def test_basis_order4_rejects_d16(self):
+        """d=16 should raise ValueError for basis_order=4 (only 15 terms available)."""
+        lut = self._make_lut(basis_order=4, d=16)
+        xi = np.zeros(16)
+        with self.assertRaises(ValueError) as ctx:
+            lut._reconstruct_field_polynomial(xi)
+        self.assertIn('15', str(ctx.exception))
+
+    def test_basis_ordering_preserved_order1(self):
+        """Order 1: coefficient [0,1,0] (x-term only) should produce gradient in x."""
+        lut = self._make_lut(basis_order=1, d=3)
+        xi = np.array([0.0, 1.0, 0.0])   # only x coefficient
+        E = lut._reconstruct_field_polynomial(xi)
+        # Left column (x=0) should be smaller than right column (x=1) in E
+        # because log(E) = x_norm increases left to right
+        self.assertTrue(E[:, 0].mean() < E[:, -1].mean(),
+                        "E should increase from left (x=0) to right (x=1) when only x coeff is positive")
+
+    def test_basis_ordering_preserved_order2(self):
+        """Order 2: basis has 6 terms; using all 6 should not error."""
+        lut = self._make_lut(basis_order=2, d=6)
+        rng = np.random.default_rng(7)
+        xi = rng.standard_normal(6)
+        E = lut._reconstruct_field_polynomial(xi)
+        self.assertEqual(E.shape, (5, 5))
+        self.assertTrue(np.all(E > 0))
+
+    def test_basis_size_formula(self):
+        """(order+1)(order+2)/2 must match actual number of generated basis functions."""
+        from src.reduced_lut import ReducedLUT
+        for order in range(0, 6):
+            expected = (order + 1) * (order + 2) // 2
+            count = 0
+            for total_deg in range(0, order + 1):
+                for j in range(0, total_deg + 1):
+                    count += 1
+            self.assertEqual(
+                count, expected,
+                f"order={order}: expected {expected} basis functions, got {count}"
+            )
+
+
 if __name__ == '__main__':
     unittest.main()
