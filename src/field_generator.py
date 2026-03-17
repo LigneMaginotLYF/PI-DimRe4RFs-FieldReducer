@@ -3,6 +3,84 @@ from scipy.special import kv as bessel_kv, gamma
 from scipy.spatial.distance import cdist
 
 
+def _compute_trend_field(n_nodes_x, n_nodes_z, length_x, length_z, rng, trend_cfg):
+    """
+    Compute a per-sample polynomial trend surface in log-E space.
+
+    The trend is separable: independent polynomial terms in x and z with no
+    cross-product terms (unless ``cross_xz`` is explicitly set in config).
+    Coefficients are sampled from ``Uniform(bounds)`` using ``rng``.
+
+    Parameters
+    ----------
+    n_nodes_x, n_nodes_z : int
+        Grid dimensions.
+    length_x, length_z : float
+        Physical domain extents (used only for normalisation, result is
+        dimensionless in log-E space).
+    rng : numpy.random.Generator
+        Random state for coefficient sampling (makes trend reproducible with seed).
+    trend_cfg : dict
+        Configuration sub-dict from ``random_field.trend``.  Expected keys:
+
+        enabled : bool
+            Master switch; returns zero array when False.
+        order_x, order_z : int (default 1)
+            Highest polynomial power for x and z directions.
+        include_const : bool (default False)
+            Whether to add a constant (zeroth-order) term.  Usually False
+            because the DC DCT coefficient already controls the spatial mean.
+        coeff_bounds_x : list of [min, max] (one pair per power 1..order_x)
+            Bounds for each x polynomial coefficient.  Scalar ``[-a, a]``
+            applied to all terms when shorter than order_x.
+        coeff_bounds_z : list of [min, max] (one pair per power 1..order_z)
+            Same for z.
+        coeff_bound_const : [min, max] (default [-1.0, 1.0])
+            Bounds for the constant term (only used when include_const=True).
+
+    Returns
+    -------
+    trend : ndarray, shape (n_nodes_z, n_nodes_x)
+        Additive log-E trend surface for one sample.
+    """
+    if not trend_cfg.get('enabled', False):
+        return np.zeros((n_nodes_z, n_nodes_x))
+
+    order_x = int(trend_cfg.get('order_x', 1))
+    order_z = int(trend_cfg.get('order_z', 1))
+    include_const = trend_cfg.get('include_const', False)
+
+    # Normalised coordinates on [0, 1]
+    x_norm = np.linspace(0.0, 1.0, n_nodes_x)
+    z_norm = np.linspace(0.0, 1.0, n_nodes_z)
+
+    trend = np.zeros((n_nodes_z, n_nodes_x))
+
+    if include_const:
+        bound = trend_cfg.get('coeff_bound_const', [-1.0, 1.0])
+        trend += rng.uniform(float(bound[0]), float(bound[1]))
+
+    coeff_bounds_x = trend_cfg.get('coeff_bounds_x', None)
+    for p in range(1, order_x + 1):
+        if coeff_bounds_x is not None and len(coeff_bounds_x) >= p:
+            b = coeff_bounds_x[p - 1]
+        else:
+            b = [-1.0, 1.0]
+        c = rng.uniform(float(b[0]), float(b[1]))
+        trend += c * (x_norm ** p)[np.newaxis, :]
+
+    coeff_bounds_z = trend_cfg.get('coeff_bounds_z', None)
+    for p in range(1, order_z + 1):
+        if coeff_bounds_z is not None and len(coeff_bounds_z) >= p:
+            b = coeff_bounds_z[p - 1]
+        else:
+            b = [-1.0, 1.0]
+        c = rng.uniform(float(b[0]), float(b[1]))
+        trend += c * (z_norm ** p)[:, np.newaxis]
+
+    return trend
+
+
 class MaternKernel:
     """Matern covariance kernel."""
 
@@ -56,7 +134,7 @@ class KLExpansionField:
         return lambdas, phis
 
     def generate_field(self, xi, nu, length_scale, n_terms=5, E_ref=10.0e6,
-                       logE_std=1.0):
+                       logE_std=1.0, rng=None, trend_cfg=None):
         """
         Generate Young's modulus field.
         E(x,z) = E_ref * exp(logE_std * sum_k sqrt(lambda_k) * phi_k(x,z) * xi_k)
@@ -68,12 +146,24 @@ class KLExpansionField:
             n_terms: number of KL terms
             E_ref: reference Young's modulus [Pa]
             logE_std: global multiplier on logE amplitude (default 1.0)
+            rng: numpy.random.Generator for trend coefficient sampling (optional).
+                 Required when trend_cfg is provided and enabled.
+            trend_cfg: dict from ``random_field.trend`` config section (optional).
+                 When enabled, a polynomial trend is added to log-E before
+                 exponentiation; see ``_compute_trend_field`` for details.
         Returns:
             E_field: shape (n_nodes_z, n_nodes_x)
         """
         lambdas, phis = self.compute_kl_basis(nu, length_scale, n_terms)
         log_E = logE_std * (phis @ (np.sqrt(lambdas) * xi))
-        E = E_ref * np.exp(np.clip(log_E, -10, 10))
+        log_E_2d = log_E.reshape(self.n_nodes_z, self.n_nodes_x)
+        if trend_cfg and rng is not None:
+            trend = _compute_trend_field(
+                self.n_nodes_x, self.n_nodes_z,
+                self.length_x, self.length_z, rng, trend_cfg,
+            )
+            log_E_2d = log_E_2d + trend
+        E = E_ref * np.exp(np.clip(log_E_2d, -10, 10))
         return E.reshape(self.n_nodes_z, self.n_nodes_x)
 
 
@@ -224,7 +314,7 @@ class DCTField:
         return sigma_k
 
     def generate_field(self, rng, nu, length_scale, n_terms=5, E_ref=10.0e6,
-                       logE_std=1.0, E_ref_factor=None):
+                       logE_std=1.0, E_ref_factor=None, trend_cfg=None):
         """
         Draw a random DCT-basis log-E field and return the E field.
 
@@ -265,6 +355,13 @@ class DCTField:
             When ``E_ref_factor is None`` the DC coefficient is also drawn from
             the Matérn distribution (original behaviour).
 
+        trend_cfg : dict or None
+            Optional trend configuration from ``random_field.trend`` config
+            section.  When ``enabled=True``, a deterministic polynomial trend
+            (separable in x and z, coefficients sampled per-sample via ``rng``)
+            is added to log-E before exponentiation.  See
+            ``_compute_trend_field`` for details.
+
         Returns
         -------
         xi : ndarray, shape (n_terms,)
@@ -287,7 +384,13 @@ class DCTField:
             xi[0] = np.log(float(E_ref_factor)) * np.sqrt(n_pts) / safe_std
 
         log_E = logE_std * (Psi @ xi)
-        E = E_ref * np.exp(np.clip(log_E, -10, 10))
+        log_E_2d = log_E.reshape(self.n_nodes_z, self.n_nodes_x)
+        if trend_cfg:
+            log_E_2d = log_E_2d + _compute_trend_field(
+                self.n_nodes_x, self.n_nodes_z,
+                self.length_x, self.length_z, rng, trend_cfg,
+            )
+        E = E_ref * np.exp(np.clip(log_E_2d, -10, 10))
         return xi, E.reshape(self.n_nodes_z, self.n_nodes_x)
 
     def reconstruct_from_coefficients(self, xi, E_ref=10.0e6, logE_std=1.0):
