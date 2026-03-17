@@ -97,19 +97,34 @@ class PhysicsDrivenMappingNN(nn.Module):
 
     def fit_with_surrogate(self, X_train, Y_train, X_val, Y_val,
                            surrogate, epochs=200, lr=1e-3, batch_size=64,
-                           colloc_idx=None):
+                           colloc_idx=None, output_representation='direct',
+                           n_output_modes=None, n_nodes_x=None):
         """
         Train dimension reducer M using frozen surrogate S.
-        Loss = MSE(S(M(xi_E))[:, colloc_idx], Y_reference[:, colloc_idx])
+
+        Loss is always computed in *node space* so that collocation indices
+        (which are node indices 0..n_x-1) remain valid regardless of the
+        surrogate's internal output representation.
+
+        When ``output_representation='dct'``, the surrogate outputs K DCT-II
+        coefficients.  A differentiable inverse-DCT projection matrix is
+        pre-computed once and used inside the training loop to convert those
+        coefficients back to n_x node values before applying ``colloc_idx``.
 
         Args:
             X_train: xi_E training data, shape (n_train, input_dim)
-            Y_train: reference responses, shape (n_train, n_x)
+            Y_train: reference responses in node space, shape (n_train, n_x)
             X_val, Y_val: validation set
             surrogate: frozen PhysicsDrivenMappingNN (S), frozen during training
             epochs, lr, batch_size: training hyperparameters
             colloc_idx: 1-D integer array of output node indices to include in
                 the loss.  If None, all output nodes are used (full-profile MSE).
+            output_representation: 'direct' | 'dct'.  When 'dct', surrogate
+                outputs K DCT coefficients which are projected to node space.
+            n_output_modes: number of DCT modes K (required when
+                output_representation='dct').
+            n_nodes_x: number of spatial nodes N (required when
+                output_representation='dct').
         """
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.to(device)
@@ -129,6 +144,30 @@ class PhysicsDrivenMappingNN(nn.Module):
         else:
             cidx = None
 
+        # Pre-compute differentiable inverse-DCT projection matrix.
+        # D has shape (N, K); each column D[:, k] is the k-th DCT-II
+        # orthonormal basis vector.  The forward pass computes:
+        #   y_nodes = y_dct_coeff @ D.T   (B,K) @ (K,N) -> (B,N)
+        # This is fully differentiable through torch.matmul.
+        dct_proj = None
+        if (output_representation == 'dct'
+                and n_output_modes is not None
+                and n_nodes_x is not None):
+            from src.dct_utils import build_idct_basis
+            D = build_idct_basis(n_modes=n_output_modes, n_nodes=n_nodes_x)
+            # Store as (K, N) for efficient matmul: y_nodes = coeff @ dct_proj
+            dct_proj = torch.tensor(D.T, dtype=torch.float32).to(device)
+            if colloc_idx is not None and len(colloc_idx) > int(n_output_modes):
+                logger.warning(
+                    f"Phase-3: collocation covers {len(colloc_idx)} nodes but "
+                    f"surrogate has only {n_output_modes} DCT output modes. "
+                    "Loss is computed in node space via inverse-DCT projection."
+                )
+            logger.info(
+                f"Phase-3 fit_with_surrogate: DCT mode, K={n_output_modes}, "
+                f"N={n_nodes_x}, using differentiable IDCT projection for node-space loss."
+            )
+
         optimizer = torch.optim.Adam(self.parameters(), lr=lr)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, patience=20, factor=0.5, min_lr=1e-5
@@ -147,7 +186,12 @@ class PhysicsDrivenMappingNN(nn.Module):
                 y_b = Y_t[idx]
                 optimizer.zero_grad()
                 xi_prime = self(x_b)
-                y_pred = surrogate(xi_prime)
+                y_pred_raw = surrogate(xi_prime)
+                # Project to node space when surrogate outputs DCT coefficients
+                if dct_proj is not None:
+                    y_pred = torch.matmul(y_pred_raw, dct_proj)
+                else:
+                    y_pred = y_pred_raw
                 if cidx is not None:
                     loss = criterion(y_pred[:, cidx], y_b[:, cidx])
                 else:
@@ -161,7 +205,11 @@ class PhysicsDrivenMappingNN(nn.Module):
             self.eval()
             with torch.no_grad():
                 xi_prime_val = self(X_v)
-                y_pred_val = surrogate(xi_prime_val)
+                y_pred_val_raw = surrogate(xi_prime_val)
+                if dct_proj is not None:
+                    y_pred_val = torch.matmul(y_pred_val_raw, dct_proj)
+                else:
+                    y_pred_val = y_pred_val_raw
                 if cidx is not None:
                     val_loss = criterion(y_pred_val[:, cidx], Y_v[:, cidx]).item()
                 else:
