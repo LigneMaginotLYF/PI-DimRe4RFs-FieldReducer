@@ -1836,7 +1836,7 @@ class TestPhase2MetricDiagnostics(unittest.TestCase):
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
     def test_metric_consistency_direct(self):
-        """For direct output representation, RMSE should be consistent with R²."""
+        """For direct output representation, RMSE/R² should be coherent."""
         from src.training_pipeline import TrainingPipeline
         config = _make_smoke_config()
         config['surrogate']['output_representation'] = 'direct'
@@ -1847,15 +1847,20 @@ class TestPhase2MetricDiagnostics(unittest.TestCase):
         with open('models/reduced_lut/pce/evaluation/metrics.json') as f:
             metrics = json.load(f)
 
-        # R² and RMSE should be coherent: high R² → small RMSE/std
-        # Specifically, RMSE < 10 * std(Y_test) when R² > 0
         self.assertIn('r2', metrics)
         self.assertIn('rmse', metrics)
-        # The metrics should be finite
+        self.assertIn('nrmse_std', metrics)
+        # All scalar metrics must be finite
         self.assertTrue(np.isfinite(metrics['rmse']))
+        self.assertTrue(np.isfinite(metrics['nrmse_range']))
+        self.assertTrue(np.isfinite(metrics['nrmse_std']))
+        # Coherence: nrmse_std < 1 means RMSE < 1 std — reasonable for a fitted surrogate
+        self.assertLess(metrics['nrmse_std'], 1.0,
+                        "RMSE exceeds one standard deviation of the test set — "
+                        "surrogate quality is unexpectedly poor")
 
     def test_metric_consistency_dct(self):
-        """For DCT output representation, metrics should be in node-space."""
+        """For DCT output representation, metrics should be in node-space and coherent."""
         from src.training_pipeline import TrainingPipeline
         config = _make_smoke_config()
         config['surrogate']['output_representation'] = 'dct'
@@ -1868,7 +1873,12 @@ class TestPhase2MetricDiagnostics(unittest.TestCase):
             metrics = json.load(f)
 
         self.assertIn('rmse', metrics)
+        self.assertIn('nrmse_std', metrics)
         self.assertTrue(np.isfinite(metrics['rmse']))
+        # Coherence: nrmse_std < 1 means RMSE < std(Y_test)
+        self.assertLess(metrics['nrmse_std'], 1.0,
+                        "RMSE exceeds one standard deviation of the test set — "
+                        "DCT surrogate quality is unexpectedly poor")
 
 
 class TestStochasticPermeability(unittest.TestCase):

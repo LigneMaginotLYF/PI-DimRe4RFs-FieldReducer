@@ -98,7 +98,8 @@ class PhysicsDrivenMappingNN(nn.Module):
     def fit_with_surrogate(self, X_train, Y_train, X_val, Y_val,
                            surrogate, epochs=200, lr=1e-3, batch_size=64,
                            colloc_idx=None, output_representation='direct',
-                           n_output_modes=None, n_nodes_x=None):
+                           n_output_modes=None, n_nodes_x=None,
+                           bspline_degree=3):
         """
         Train dimension reducer M using frozen surrogate S.
 
@@ -106,10 +107,14 @@ class PhysicsDrivenMappingNN(nn.Module):
         (which are node indices 0..n_x-1) remain valid regardless of the
         surrogate's internal output representation.
 
-        When ``output_representation='dct'``, the surrogate outputs K DCT-II
-        coefficients.  A differentiable inverse-DCT projection matrix is
-        pre-computed once and used inside the training loop to convert those
-        coefficients back to n_x node values before applying ``colloc_idx``.
+        When ``output_representation`` is not ``'direct'``, a differentiable
+        inverse-basis projection matrix is pre-computed once and used inside
+        the training loop to convert surrogate outputs back to n_x node values
+        before applying ``colloc_idx``:
+
+        - ``'dct'``: inverse-DCT projection from K DCT-II coefficients to N nodes.
+        - ``'poly'``: Vandermonde evaluation from K polynomial coefficients to N nodes.
+        - ``'bspline'``: B-spline evaluation from K B-spline coefficients to N nodes.
 
         Args:
             X_train: xi_E training data, shape (n_train, input_dim)
@@ -119,12 +124,10 @@ class PhysicsDrivenMappingNN(nn.Module):
             epochs, lr, batch_size: training hyperparameters
             colloc_idx: 1-D integer array of output node indices to include in
                 the loss.  If None, all output nodes are used (full-profile MSE).
-            output_representation: 'direct' | 'dct'.  When 'dct', surrogate
-                outputs K DCT coefficients which are projected to node space.
-            n_output_modes: number of DCT modes K (required when
-                output_representation='dct').
-            n_nodes_x: number of spatial nodes N (required when
-                output_representation='dct').
+            output_representation: 'direct' | 'dct' | 'poly' | 'bspline'.
+            n_output_modes: number of output modes K.
+            n_nodes_x: number of spatial nodes N.
+            bspline_degree: B-spline degree (only used when 'bspline').
         """
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.to(device)
@@ -144,29 +147,75 @@ class PhysicsDrivenMappingNN(nn.Module):
         else:
             cidx = None
 
-        # Pre-compute differentiable inverse-DCT projection matrix.
-        # D has shape (N, K); each column D[:, k] is the k-th DCT-II
-        # orthonormal basis vector.  The forward pass computes:
-        #   y_nodes = y_dct_coeff @ D.T   (B,K) @ (K,N) -> (B,N)
+        # Pre-compute differentiable inverse-basis projection matrix.
+        # coeff_proj has shape (K, N); the forward pass computes:
+        #   y_nodes = y_coeff @ coeff_proj   (B,K) @ (K,N) -> (B,N)
         # This is fully differentiable through torch.matmul.
-        dct_proj = None
-        if (output_representation == 'dct'
-                and n_output_modes is not None
-                and n_nodes_x is not None):
-            from src.dct_utils import build_idct_basis
-            D = build_idct_basis(n_modes=n_output_modes, n_nodes=n_nodes_x)
-            # Store as (K, N) for efficient matmul: y_nodes = coeff @ dct_proj
-            dct_proj = torch.tensor(D.T, dtype=torch.float32).to(device)
-            if colloc_idx is not None and len(colloc_idx) > int(n_output_modes):
-                logger.warning(
-                    f"Phase-3: collocation covers {len(colloc_idx)} nodes but "
-                    f"surrogate has only {n_output_modes} DCT output modes. "
-                    "Loss is computed in node space via inverse-DCT projection."
+        coeff_proj = None
+        if n_output_modes is not None and n_nodes_x is not None:
+            if output_representation == 'dct':
+                from src.dct_utils import build_idct_basis
+                D = build_idct_basis(n_modes=n_output_modes, n_nodes=n_nodes_x)
+                coeff_proj_np = D.T  # (K, N): y_nodes = coeff @ coeff_proj
+                if colloc_idx is not None and len(colloc_idx) > int(n_output_modes):
+                    logger.warning(
+                        f"Phase-3: collocation covers {len(colloc_idx)} nodes but "
+                        f"surrogate has only {n_output_modes} DCT output modes. "
+                        "Loss is computed in node space via inverse-DCT projection."
+                    )
+                logger.info(
+                    f"Phase-3 fit_with_surrogate: DCT mode, K={n_output_modes}, "
+                    f"N={n_nodes_x}, using differentiable IDCT projection for node-space loss."
                 )
-            logger.info(
-                f"Phase-3 fit_with_surrogate: DCT mode, K={n_output_modes}, "
-                f"N={n_nodes_x}, using differentiable IDCT projection for node-space loss."
-            )
+            elif output_representation == 'poly':
+                # Vandermonde matrix: V[node, k] = x_norm[node]^(K-1-k)
+                import numpy as np_  # avoid shadowing outer np
+                x_norm = np_.linspace(0, 1, n_nodes_x)
+                K = n_output_modes
+                powers = np_.arange(K - 1, -1, -1, dtype=np_.float64)
+                V = x_norm[:, None] ** powers[None, :]  # (N, K)
+                coeff_proj_np = V.T  # (K, N): y_nodes = coeff @ V.T
+                logger.info(
+                    f"Phase-3 fit_with_surrogate: poly mode, K={n_output_modes}, "
+                    f"N={n_nodes_x}, using differentiable Vandermonde projection."
+                )
+            elif output_representation == 'bspline':
+                import numpy as np_
+                from scipy.interpolate import BSpline
+                k = bspline_degree
+                x_norm = np_.linspace(0, 1, n_nodes_x)
+                K = n_output_modes
+                if K <= k:
+                    raise ValueError(
+                        f"n_output_modes={K} must be > bspline_degree={k}."
+                    )
+                n_internal = K - k - 1
+                if n_internal > 0:
+                    t_internal = np_.linspace(0, 1, n_internal + 2)[1:-1]
+                else:
+                    t_internal = np_.array([])
+                t_full = np_.concatenate([
+                    np_.zeros(k + 1), t_internal, np_.ones(k + 1)
+                ])
+                B = np_.column_stack([
+                    BSpline.basis_element(
+                        t_full[i:i + k + 2], extrapolate=False
+                    )(x_norm)
+                    for i in range(K)
+                ])
+                B = np_.nan_to_num(B, nan=0.0)  # (N, K)
+                coeff_proj_np = B.T  # (K, N)
+                logger.info(
+                    f"Phase-3 fit_with_surrogate: bspline mode, K={n_output_modes}, "
+                    f"degree={k}, N={n_nodes_x}, using differentiable B-spline projection."
+                )
+            else:
+                coeff_proj_np = None
+
+            if coeff_proj_np is not None:
+                coeff_proj = torch.tensor(coeff_proj_np, dtype=torch.float32).to(device)
+        # Legacy path for dct when n_output_modes/n_nodes_x not supplied
+        dct_proj = coeff_proj  # keep internal name for backward compat in loop below
 
         optimizer = torch.optim.Adam(self.parameters(), lr=lr)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -187,7 +236,7 @@ class PhysicsDrivenMappingNN(nn.Module):
                 optimizer.zero_grad()
                 xi_prime = self(x_b)
                 y_pred_raw = surrogate(xi_prime)
-                # Project to node space when surrogate outputs DCT coefficients
+                # Project to node space when surrogate outputs basis coefficients
                 if dct_proj is not None:
                     y_pred = torch.matmul(y_pred_raw, dct_proj)
                 else:

@@ -75,7 +75,7 @@ class PolynomialChaosExpansion:
 
     def fit_with_surrogate(self, X_train, Y_train, surrogate, colloc_idx=None,
                            output_representation='direct', n_output_modes=None,
-                           n_nodes_x=None):
+                           n_nodes_x=None, bspline_degree=3):
         """
         Fit PCE as dimension reducer M: xi_E -> xi' using surrogate-based loss.
 
@@ -83,9 +83,14 @@ class PolynomialChaosExpansion:
         (which are node indices 0..n_x-1) remain valid regardless of the
         surrogate's internal output representation.
 
-        When ``output_representation='dct'``, the surrogate returns K DCT
-        coefficients.  These are mapped to full node-space predictions via an
-        inverse-DCT projection before the collocation mask is applied.
+        When ``output_representation`` is not ``'direct'``, an inverse-basis
+        projection matrix is pre-computed once and used to map surrogate
+        coefficient outputs to full node-space predictions before the
+        collocation mask is applied:
+
+        - ``'dct'``: inverse-DCT projection.
+        - ``'poly'``: Vandermonde evaluation matrix.
+        - ``'bspline'``: B-spline design matrix.
 
         Uses a two-step approach: first fit PCE to map xi_E -> xi' by minimizing
         ||S(M(xi_E))[:, colloc_idx] - Y_train[:, colloc_idx]||, approximated by
@@ -94,30 +99,65 @@ class PolynomialChaosExpansion:
         Args:
             X_train: shape (n_samples, n_inputs) - KL coefficients xi_E
             Y_train: shape (n_samples, n_x) - reference settlement profiles
-            surrogate: fitted surrogate S: xi'(d) -> (K,) in DCT mode or (n_x,)
+            surrogate: fitted surrogate S: xi'(d) -> (K,) in coeff mode or (n_x,)
             colloc_idx: 1-D integer array of node indices (0..n_x-1) to include
                 in the loss.  If None, all nodes are used.
-            output_representation: 'direct' | 'dct'.
-            n_output_modes: K, number of DCT modes (required for DCT mode).
-            n_nodes_x: N, number of spatial nodes (required for DCT mode).
+            output_representation: 'direct' | 'dct' | 'poly' | 'bspline'.
+            n_output_modes: K, number of output modes.
+            n_nodes_x: N, number of spatial nodes.
+            bspline_degree: B-spline degree (only used when 'bspline').
         """
         from scipy.optimize import minimize
 
-        # Pre-compute numpy inverse-DCT projection matrix for DCT mode.
-        # idct_basis has shape (N, K); the node-space prediction for a
-        # coefficient vector c (length K) is: y_nodes = idct_basis @ c
-        idct_basis = None
-        if (output_representation == 'dct'
-                and n_output_modes is not None
-                and n_nodes_x is not None):
-            from src.dct_utils import build_idct_basis
-            idct_basis = build_idct_basis(n_modes=n_output_modes, n_nodes=n_nodes_x)
-            if colloc_idx is not None and len(colloc_idx) > int(n_output_modes):
-                logger.warning(
-                    f"Phase-3 PCE: collocation covers {len(colloc_idx)} nodes "
-                    f"but surrogate has only {n_output_modes} DCT output modes. "
-                    "Loss is computed in node space via inverse-DCT projection."
+        # Pre-compute numpy inverse-basis projection matrix.
+        # inv_basis has shape (N, K); the node-space prediction for a
+        # coefficient vector c (length K) is: y_nodes = inv_basis @ c
+        inv_basis = None
+        if n_output_modes is not None and n_nodes_x is not None:
+            if output_representation == 'dct':
+                from src.dct_utils import build_idct_basis
+                inv_basis = build_idct_basis(n_modes=n_output_modes, n_nodes=n_nodes_x)
+                if colloc_idx is not None and len(colloc_idx) > int(n_output_modes):
+                    logger.warning(
+                        f"Phase-3 PCE: collocation covers {len(colloc_idx)} nodes "
+                        f"but surrogate has only {n_output_modes} DCT output modes. "
+                        "Loss is computed in node space via inverse-DCT projection."
+                    )
+            elif output_representation == 'poly':
+                x_norm = np.linspace(0, 1, n_nodes_x)
+                K = n_output_modes
+                powers = np.arange(K - 1, -1, -1, dtype=np.float64)
+                inv_basis = x_norm[:, None] ** powers[None, :]  # (N, K)
+                logger.info(
+                    f"Phase-3 PCE fit_with_surrogate: poly mode, "
+                    f"K={n_output_modes}, N={n_nodes_x}."
                 )
+            elif output_representation == 'bspline':
+                from scipy.interpolate import BSpline
+                k = bspline_degree
+                K = n_output_modes
+                x_norm = np.linspace(0, 1, n_nodes_x)
+                if K <= k:
+                    raise ValueError(
+                        f"n_output_modes={K} must be > bspline_degree={k}."
+                    )
+                n_internal = K - k - 1
+                t_internal = np.linspace(0, 1, n_internal + 2)[1:-1] if n_internal > 0 else np.array([])
+                t_full = np.concatenate([np.zeros(k + 1), t_internal, np.ones(k + 1)])
+                B = np.column_stack([
+                    BSpline.basis_element(
+                        t_full[i:i + k + 2], extrapolate=False
+                    )(x_norm)
+                    for i in range(K)
+                ])
+                inv_basis = np.nan_to_num(B, nan=0.0)  # (N, K)
+                logger.info(
+                    f"Phase-3 PCE fit_with_surrogate: bspline mode, "
+                    f"K={n_output_modes}, degree={k}, N={n_nodes_x}."
+                )
+
+        # Legacy alias kept for clarity in the inner functions
+        idct_basis = inv_basis
 
         n_samples = X_train.shape[0]
         xi_prime_targets = np.zeros((n_samples, self.n_outputs))
@@ -127,7 +167,7 @@ class PolynomialChaosExpansion:
 
             def obj(xi_p):
                 y_raw = surrogate.predict(xi_p.reshape(1, -1))[0]
-                # Convert to node space when surrogate outputs DCT coefficients
+                # Convert to node space when surrogate outputs basis coefficients
                 if idct_basis is not None:
                     y_pred = idct_basis @ y_raw
                 else:

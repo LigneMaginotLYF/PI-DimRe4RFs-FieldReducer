@@ -286,8 +286,8 @@ class TrainingPipeline:
                 f"k_h={'log-uniform' if k_h_stochastic else 'fixed'} "
                 f"k_v={'log-uniform' if k_v_stochastic else 'fixed'} "
                 f"| feature layout: cols 0..{n_terms - 1}=xi_E"
-                + (f", col {n_terms}=log_k_h" if k_h_stochastic else "")
-                + (f", col {n_terms + int(k_h_stochastic)}=log_k_v" if k_v_stochastic else "")
+                + (f", col {n_terms}=norm_log_k_h (in [-1,1])" if k_h_stochastic else "")
+                + (f", col {n_terms + int(k_h_stochastic)}=norm_log_k_v (in [-1,1])" if k_v_stochastic else "")
             )
 
         # Trend in log-E space (optional, both DCT and KL paths)
@@ -329,18 +329,26 @@ class TrainingPipeline:
                     trend_cfg=trend_cfg if trend_enabled else None,
                 )
             X_train[i, :n_terms] = xi_E
-            # Sample stochastic permeability scalars and append to feature vector
+            # Sample stochastic permeability scalars and append to feature vector.
+            # Stored as standardized values in [-1, 1] (normalized log-space) so that
+            # PCE Hermite/Legendre bases and NN inputs remain O(1) magnitude.
             stoch_cols = []
             if k_h_stochastic:
                 log_k_h = rng.uniform(np.log(k_h_range[0]), np.log(k_h_range[1]))
                 k_h_sample = np.exp(log_k_h)
-                stoch_cols.append(log_k_h)
+                norm_log_k_h = 2.0 * (log_k_h - np.log(k_h_range[0])) / (
+                    np.log(k_h_range[1]) - np.log(k_h_range[0])
+                ) - 1.0
+                stoch_cols.append(norm_log_k_h)
             else:
                 k_h_sample = k_h
             if k_v_stochastic:
                 log_k_v = rng.uniform(np.log(k_v_range[0]), np.log(k_v_range[1]))
                 k_v_sample = np.exp(log_k_v)
-                stoch_cols.append(log_k_v)
+                norm_log_k_v = 2.0 * (log_k_v - np.log(k_v_range[0])) / (
+                    np.log(k_v_range[1]) - np.log(k_v_range[0])
+                ) - 1.0
+                stoch_cols.append(norm_log_k_v)
             else:
                 k_v_sample = k_v
             if stoch_cols:
@@ -492,8 +500,8 @@ class TrainingPipeline:
         metrics['y_max'] = y_max
 
         logger.info(
-            f"Phase 2 [{surrogate_type}] per-output diagnostics: "
-            f"Y_test mean={y_mean:.4e}, std={y_std:.4e}, "
+            f"Phase 2 [{surrogate_type}] global Y_test diagnostics: "
+            f"mean={y_mean:.4e}, std={y_std:.4e}, "
             f"min={y_min:.4e}, max={y_max:.4e}"
         )
         logger.info(
@@ -672,6 +680,7 @@ class TrainingPipeline:
                 output_representation=reduced_lut.output_representation,
                 n_output_modes=reduced_lut.n_output_modes,
                 n_nodes_x=reduced_lut.n_x,
+                bspline_degree=reduced_lut.bspline_degree,
             )
         else:
             from src.mapping_learner_pce import PolynomialChaosExpansion
@@ -690,7 +699,8 @@ class TrainingPipeline:
                                        colloc_idx=colloc_idx,
                                        output_representation=reduced_lut.output_representation,
                                        n_output_modes=reduced_lut.n_output_modes,
-                                       n_nodes_x=reduced_lut.n_x)
+                                       n_nodes_x=reduced_lut.n_x,
+                                       bspline_degree=reduced_lut.bspline_degree)
         return reducer
 
     def phase4_evaluate(self, reducer, reduced_lut, X_test, Y_test):
@@ -943,14 +953,16 @@ class TrainingPipeline:
         for i in range(n):
             nu = rng.uniform(*nu_range) if nu_sampling else nu_ref
             length_scale = rng.uniform(*ls_range) if ls_sampling else ls_ref
+            # Slice to first n_terms to drop any appended stochastic scalar features
+            xi_E_row = X_test[i, :n_terms]
             if field_basis == 'dct':
-                # DCT: X_test[i] are the stored coefficients; reconstruct directly.
+                # DCT: X_test[i, :n_terms] are the stored coefficients; reconstruct directly.
                 E_field = field_gen.reconstruct_from_coefficients(
-                    X_test[i], E_ref=E_ref, logE_std=logE_std
+                    xi_E_row, E_ref=E_ref, logE_std=logE_std
                 )
             else:
                 E_field = field_gen.generate_field(
-                    X_test[i], nu, length_scale,
+                    xi_E_row, nu, length_scale,
                     n_terms=n_terms, E_ref=E_ref, logE_std=logE_std,
                 )
             Y_direct[i] = solver.run(E_field, k_h, k_v)
