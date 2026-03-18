@@ -169,10 +169,9 @@ class PhysicsDrivenMappingNN(nn.Module):
                 )
             elif output_representation == 'poly':
                 # Vandermonde matrix: V[node, k] = x_norm[node]^(K-1-k)
-                import numpy as np_  # avoid shadowing outer np
-                x_norm = np_.linspace(0, 1, n_nodes_x)
+                x_norm = np.linspace(0, 1, n_nodes_x)
                 K = n_output_modes
-                powers = np_.arange(K - 1, -1, -1, dtype=np_.float64)
+                powers = np.arange(K - 1, -1, -1, dtype=np.float64)
                 V = x_norm[:, None] ** powers[None, :]  # (N, K)
                 coeff_proj_np = V.T  # (K, N): y_nodes = coeff @ V.T
                 logger.info(
@@ -180,10 +179,9 @@ class PhysicsDrivenMappingNN(nn.Module):
                     f"N={n_nodes_x}, using differentiable Vandermonde projection."
                 )
             elif output_representation == 'bspline':
-                import numpy as np_
                 from scipy.interpolate import BSpline
                 k = bspline_degree
-                x_norm = np_.linspace(0, 1, n_nodes_x)
+                x_norm = np.linspace(0, 1, n_nodes_x)
                 K = n_output_modes
                 if K <= k:
                     raise ValueError(
@@ -191,19 +189,19 @@ class PhysicsDrivenMappingNN(nn.Module):
                     )
                 n_internal = K - k - 1
                 if n_internal > 0:
-                    t_internal = np_.linspace(0, 1, n_internal + 2)[1:-1]
+                    t_internal = np.linspace(0, 1, n_internal + 2)[1:-1]
                 else:
-                    t_internal = np_.array([])
-                t_full = np_.concatenate([
-                    np_.zeros(k + 1), t_internal, np_.ones(k + 1)
+                    t_internal = np.array([])
+                t_full = np.concatenate([
+                    np.zeros(k + 1), t_internal, np.ones(k + 1)
                 ])
-                B = np_.column_stack([
+                B = np.column_stack([
                     BSpline.basis_element(
                         t_full[i:i + k + 2], extrapolate=False
                     )(x_norm)
                     for i in range(K)
                 ])
-                B = np_.nan_to_num(B, nan=0.0)  # (N, K)
+                B = np.nan_to_num(B, nan=0.0)  # (N, K)
                 coeff_proj_np = B.T  # (K, N)
                 logger.info(
                     f"Phase-3 fit_with_surrogate: bspline mode, K={n_output_modes}, "

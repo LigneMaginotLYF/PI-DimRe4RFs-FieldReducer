@@ -346,8 +346,9 @@ class ReducedLUT:
         deg = self.n_output_modes - 1
         if self.n_output_modes > n_x:
             raise ValueError(
-                f"n_output_modes={self.n_output_modes} exceeds n_x={n_x}. "
-                "Reduce n_output_modes to avoid under-determined polynomial fit."
+                f"Polynomial fit is ill-posed: need at least n_output_modes={self.n_output_modes} "
+                f"data points but only n_x={n_x} are available. "
+                "Reduce n_output_modes or increase the number of spatial nodes."
             )
         x_norm = np.linspace(0, 1, n_x)
         # Build Vandermonde matrix: shape (n_x, n_output_modes) in descending power order
