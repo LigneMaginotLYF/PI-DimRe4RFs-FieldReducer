@@ -465,11 +465,12 @@ class TrainingPipeline:
 
         Y_pred = lut.predict(X_test)
 
-        # Shape assertion: predictions must match ground-truth dimensions
-        assert Y_pred.shape == Y_test.shape, (
-            f"Shape mismatch in Phase-2 evaluation: "
-            f"Y_pred.shape={Y_pred.shape} != Y_test.shape={Y_test.shape}"
-        )
+        # Shape check: predictions must match ground-truth dimensions
+        if Y_pred.shape != Y_test.shape:
+            raise ValueError(
+                f"Shape mismatch in Phase-2 evaluation: "
+                f"Y_pred.shape={Y_pred.shape} != Y_test.shape={Y_test.shape}"
+            )
 
         metrics = Validation.compute_metrics(Y_pred, Y_test)
 
