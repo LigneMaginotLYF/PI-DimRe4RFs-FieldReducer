@@ -207,8 +207,9 @@ Settings for the Phase-2 surrogate S: ξ' → Y and the Phase-3 reducer backbone
 | `epochs` | int | 200 | — | Training epochs. |
 | `learning_rate` | float | 1.0e-3 | — | Initial Adam learning rate. |
 | `batch_size` | int | 64 | — | Mini-batch size. |
-| `output_representation` | str | `"direct"` | `"direct"`, `"dct"` | **Output representation for Phase-2 surrogate.** `"direct"` (default): surrogate predicts the full settlement profile Y(x) directly. `"dct"`: surrogate predicts the first `n_output_modes` 1-D DCT-II coefficients of Y(x); `predict()` applies the inverse DCT to return the full reconstructed profile. DCT output avoids oscillatory artefacts by constraining the predicted curve to a smooth (C²) function basis. |
-| `n_output_modes` | int | 8 | — | Number of 1-D DCT modes used when `output_representation: "dct"`. Smaller values give smoother (lower-frequency) predictions; increase for more spatial detail. Has no effect when `output_representation: "direct"`. |
+| `output_representation` | str | `"direct"` | `"direct"`, `"dct"`, `"poly"`, `"bspline"` | **Output representation for Phase-2 surrogate.** `"direct"` (default): surrogate predicts the full settlement profile Y(x) directly. `"dct"`: surrogate predicts the first `n_output_modes` 1-D DCT-II coefficients of Y(x); `predict()` applies the inverse DCT to return the full reconstructed profile. `"poly"`: surrogate predicts `n_output_modes` polynomial coefficients (degree = n_output_modes − 1) fitted to Y(x) via `np.polyfit`. `"bspline"`: surrogate predicts `n_output_modes` B-spline basis coefficients fitted to Y(x) with a B-spline of degree `bspline_degree`. |
+| `n_output_modes` | int | 8 | — | Number of output modes/coefficients for transformed output representations. For `"dct"`: number of DCT-II modes. For `"poly"`: number of polynomial terms (= degree + 1). For `"bspline"`: number of B-spline basis functions (must be > `bspline_degree`). Has no effect when `output_representation: "direct"`. |
+| `bspline_degree` | int | 3 | — | B-spline polynomial degree used when `output_representation: "bspline"`. Must satisfy `n_output_modes > bspline_degree`. Default: 3 (cubic splines). |
 
 ### Surrogate DCT output representation
 
@@ -221,6 +222,23 @@ When `output_representation: "dct"`:
 
 > **Tip**: Start with `n_output_modes: 8` (captures the dominant settlement shape).
 > Increase if validation R² is low due to missing high-frequency detail.
+
+### Surrogate polynomial output representation
+
+When `output_representation: "poly"`:
+- The settlement profile is fitted with a polynomial of degree `n_output_modes − 1` using `np.polyfit` (least-squares).
+- The surrogate predicts the polynomial coefficients (in descending power order, matching `np.polyfit` convention).
+- At inference, `ReducedLUT.predict()` evaluates the polynomial at the normalised x-grid `linspace(0,1,n_nodes_x)`.
+- Suitable for monotone or near-polynomial settlement profiles.
+
+### Surrogate B-spline output representation
+
+When `output_representation: "bspline"`:
+- The settlement profile is fitted with `n_output_modes` B-spline basis functions of degree `bspline_degree` using `scipy.interpolate.make_lsq_spline` with uniformly spaced internal knots.
+- The surrogate predicts the spline coefficients.
+- At inference, `ReducedLUT.predict()` evaluates the B-spline using `scipy.interpolate.BSpline`.
+- Provides flexible smooth approximation; cubic splines (`bspline_degree: 3`) are recommended.
+- **Constraint**: `n_output_modes > bspline_degree` must hold; a `ValueError` is raised otherwise.
 
 ---
 
@@ -388,6 +406,55 @@ Train/validation/test split fractions (must sum to ≤ 1.0).
 | `train_fraction` | float | 0.6 | Fraction of Phase-1 data used for reducer training. |
 | `val_fraction` | float | 0.2 | Fraction used for validation (early stopping). |
 | `test_fraction` | float | 0.2 | Fraction held out for Phase-4 test evaluation. |
+
+---
+
+## `stochastic_inputs`
+
+Optional per-sample stochastic permeability scalars appended to the Phase-1 feature vector.
+
+By default, `k_h` and `k_v` are fixed constants taken from the `material` section.
+When either flag is set to `true`, the corresponding permeability is sampled independently
+for each training sample and its log value is appended to `X_train.npy`.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `k_h` | bool | `false` | If `true`, horizontal permeability is sampled per-sample. |
+| `k_v` | bool | `false` | If `true`, vertical permeability is sampled per-sample. |
+| `k_h_range` | [float, float] | `[1e-13, 1e-10]` | Sampling range in m² for k_h (log-uniform). |
+| `k_v_range` | [float, float] | `[1e-13, 1e-10]` | Sampling range in m² for k_v (log-uniform). |
+
+### Feature layout
+
+| Feature columns | Content |
+|-----------------|---------|
+| `0 … n_terms_E-1` | Random field coefficients ξ_E (always present). |
+| `n_terms_E` | `log(k_h)` — only when `k_h: true`. |
+| `n_terms_E + int(k_h)` | `log(k_v)` — only when `k_v: true`. |
+
+Total feature width: `n_terms_E + int(k_h) + int(k_v)`.
+
+### How stochastic scalars propagate through the pipeline
+
+- **Phase 1**: for each sample, k_h and/or k_v are drawn log-uniformly from their
+  configured ranges and used in the Biot solver call.  The log values are appended
+  to `X_train.npy`.
+- **Phase 2 (LUT)**: the LUT grid is extended to `effective_d = d + n_stochastic_scalars`
+  dimensions.  The extra dimensions are sampled log-uniformly (not Gaussian).  The
+  solver is called with the per-point k_h/k_v extracted from the scalar part of ξ'.
+- **Phase 3**: the reducer maps `X_train` (width = n_terms_E + n_stochastic) to ξ'
+  (width = effective_d).
+- **Backward compatibility**: when both flags are `false` (default), the behaviour is
+  identical to the no-stochastic case.  Old LUT config.json files without stochastic
+  fields default to `n_stochastic_scalars = 0`.
+
+Example:
+```yaml
+stochastic_inputs:
+  k_h: true
+  k_v: false
+  k_h_range: [1.0e-14, 1.0e-10]
+```
 
 ---
 

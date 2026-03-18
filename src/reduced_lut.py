@@ -48,6 +48,16 @@ class ReducedLUT:
         surr_cfg = config.get('surrogate') or {}
         self.output_representation = surr_cfg.get('output_representation', 'direct')
         self.n_output_modes = surr_cfg.get('n_output_modes', 8)
+        self.bspline_degree = surr_cfg.get('bspline_degree', 3)
+
+        stoch_cfg = config.get('stochastic_inputs') or {}
+        self.k_h_stochastic = bool(stoch_cfg.get('k_h', False))
+        self.k_v_stochastic = bool(stoch_cfg.get('k_v', False))
+        self.k_h_range = stoch_cfg.get('k_h_range', [1e-13, 1e-10])
+        self.k_v_range = stoch_cfg.get('k_v_range', [1e-13, 1e-10])
+        self.n_stochastic_scalars = int(self.k_h_stochastic) + int(self.k_v_stochastic)
+        # Effective LUT dimension: d (for E coefficients) + stochastic scalars
+        self.effective_d = self.d + self.n_stochastic_scalars
 
         self.config_hash = self._compute_config_hash()
 
@@ -83,6 +93,8 @@ class ReducedLUT:
             f"n_nodes_z={self.n_z}",
             f"output_representation={self.output_representation}",
             f"n_output_modes={self.n_output_modes}",
+            f"k_h_stochastic={self.k_h_stochastic}",
+            f"k_v_stochastic={self.k_v_stochastic}",
         ]
         if self.basis_type == 'kl':
             parts += [
@@ -98,18 +110,60 @@ class ReducedLUT:
         return hashlib.md5(key.encode()).hexdigest()[:8]
 
     def generate_grid(self, seed=None):
-        """Generate grid points in d-dimensional reduced parameter space."""
+        """Generate grid points in effective_d-dimensional reduced parameter space.
+
+        For the first ``d`` dimensions (E-field coefficients), points are drawn
+        from a standard normal distribution.  For any stochastic scalar dimensions
+        (log_k_h, log_k_v), points are drawn uniformly from the configured
+        log-space ranges.
+        """
         rng = np.random.default_rng(seed)
         if self.grid_type == 'random':
-            self.grid_points = rng.standard_normal((self.n_grid_points, self.d))
+            # E-field coefficient dimensions: standard normal
+            xi_E = rng.standard_normal((self.n_grid_points, self.d))
+            parts = [xi_E]
+            # Stochastic scalar dimensions: log-uniform in configured ranges
+            if self.k_h_stochastic:
+                log_kh = rng.uniform(
+                    np.log(self.k_h_range[0]), np.log(self.k_h_range[1]),
+                    size=(self.n_grid_points, 1),
+                )
+                parts.append(log_kh)
+            if self.k_v_stochastic:
+                log_kv = rng.uniform(
+                    np.log(self.k_v_range[0]), np.log(self.k_v_range[1]),
+                    size=(self.n_grid_points, 1),
+                )
+                parts.append(log_kv)
+            self.grid_points = np.concatenate(parts, axis=1)
         else:
-            n_side = int(round(self.n_grid_points ** (1 / self.d))) + 1
-            vals = np.linspace(-2, 2, n_side)
-            grids = np.meshgrid(*([vals] * self.d), indexing='ij')
-            grid = np.column_stack([g.ravel() for g in grids])
+            n_side = int(round(self.n_grid_points ** (1 / self.effective_d))) + 1
+            # Build grid for E-field dimensions from standard normal range [-2, 2]
+            vals_E = np.linspace(-2, 2, n_side)
+            grids_E = np.meshgrid(*([vals_E] * self.d), indexing='ij')
+            grid_E = np.column_stack([g.ravel() for g in grids_E])
+            # Build grid for stochastic scalar dimensions from log-uniform range
+            scalar_grids = []
+            if self.k_h_stochastic:
+                vals_kh = np.linspace(np.log(self.k_h_range[0]), np.log(self.k_h_range[1]), n_side)
+                scalar_grids.append(vals_kh)
+            if self.k_v_stochastic:
+                vals_kv = np.linspace(np.log(self.k_v_range[0]), np.log(self.k_v_range[1]), n_side)
+                scalar_grids.append(vals_kv)
+            if scalar_grids:
+                all_grids = np.meshgrid(
+                    *([np.linspace(-2, 2, n_side)] * self.d + scalar_grids), indexing='ij'
+                )
+                grid = np.column_stack([g.ravel() for g in all_grids])
+            else:
+                grid = grid_E
             idx = rng.choice(len(grid), size=min(self.n_grid_points, len(grid)), replace=False)
             self.grid_points = grid[idx]
-        logger.info(f"Generated {len(self.grid_points)} grid points in {self.d}-D space")
+        logger.info(
+            f"Generated {len(self.grid_points)} grid points in "
+            f"{self.effective_d}-D space (d={self.d} E-dims + "
+            f"{self.n_stochastic_scalars} stochastic scalars)"
+        )
         return self.grid_points
 
     def _reconstruct_field_polynomial(self, xi_prime):
@@ -239,21 +293,125 @@ class ReducedLUT:
         B_padded[:, :modes] = b[:, :modes]
         return idct(B_padded, type=2, norm='ortho', axis=1)
 
+    def _to_poly_space(self, Y):
+        """Transform settlement profiles to polynomial coefficient space.
+
+        Fits a polynomial of degree (n_output_modes - 1) to each row of Y
+        using numpy.polyfit (least-squares fit).
+
+        Args:
+            Y: shape (n, n_x) - full settlement profiles
+        Returns:
+            coeffs: shape (n, n_output_modes) - polynomial coefficients in
+                    descending power order (same as np.polyfit output)
+        """
+        n, n_x = Y.shape
+        deg = self.n_output_modes - 1
+        x_norm = np.linspace(0, 1, n_x)
+        coeffs = np.zeros((n, self.n_output_modes))
+        for i in range(n):
+            coeffs[i] = np.polyfit(x_norm, Y[i], deg)
+        return coeffs
+
+    def _from_poly_space(self, coeffs):
+        """Reconstruct settlement profiles from polynomial coefficients.
+
+        Args:
+            coeffs: shape (n, n_output_modes) - polynomial coefficients in
+                    descending power order (np.polyfit convention)
+        Returns:
+            Y: shape (n, n_x) - reconstructed settlement profiles
+        """
+        n = coeffs.shape[0]
+        x_norm = np.linspace(0, 1, self.n_x)
+        Y = np.zeros((n, self.n_x))
+        for i in range(n):
+            Y[i] = np.polyval(coeffs[i], x_norm)
+        return Y
+
+    def _build_bspline_knots(self):
+        """Build the full B-spline knot sequence for the configured settings.
+
+        Returns:
+            t_full: 1-D array of knots (including endpoint repetitions)
+        """
+        k = self.bspline_degree
+        n_modes = self.n_output_modes
+        if n_modes <= k:
+            raise ValueError(
+                f"n_output_modes={n_modes} must be greater than "
+                f"bspline_degree={k} for B-spline representation."
+            )
+        n_internal = n_modes - k - 1
+        if n_internal > 0:
+            t_internal = np.linspace(0, 1, n_internal + 2)[1:-1]
+        else:
+            t_internal = np.array([])
+        t_full = np.concatenate([np.zeros(k + 1), t_internal, np.ones(k + 1)])
+        return t_full
+
+    def _to_bspline_space(self, Y):
+        """Transform settlement profiles to B-spline coefficient space.
+
+        Fits a B-spline with ``n_output_modes`` basis functions (degree
+        ``bspline_degree``) to each row of Y using scipy.interpolate.make_lsq_spline.
+
+        Args:
+            Y: shape (n, n_x) - full settlement profiles
+        Returns:
+            coeffs: shape (n, n_output_modes) - B-spline coefficients
+        """
+        from scipy.interpolate import make_lsq_spline
+        n, n_x = Y.shape
+        k = self.bspline_degree
+        x_norm = np.linspace(0, 1, n_x)
+        t_full = self._build_bspline_knots()
+        coeffs = np.zeros((n, self.n_output_modes))
+        for i in range(n):
+            spl = make_lsq_spline(x_norm, Y[i], t_full, k=k)
+            coeffs[i] = spl.c
+        return coeffs
+
+    def _from_bspline_space(self, coeffs):
+        """Reconstruct settlement profiles from B-spline coefficients.
+
+        Args:
+            coeffs: shape (n, n_output_modes) - B-spline coefficients
+        Returns:
+            Y: shape (n, n_x) - reconstructed settlement profiles
+        """
+        from scipy.interpolate import BSpline
+        n = coeffs.shape[0]
+        k = self.bspline_degree
+        x_norm = np.linspace(0, 1, self.n_x)
+        t_full = self._build_bspline_knots()
+        Y = np.zeros((n, self.n_x))
+        for i in range(n):
+            spl = BSpline(t_full, coeffs[i], k)
+            Y[i] = spl(x_norm)
+        return Y
+
     def _reconstruct_field(self, xi_prime):
         """
         Reconstruct material E field from d-dimensional reduced coefficients.
 
+        When stochastic scalars are present, xi_prime may have shape
+        (effective_d,) = (d + n_stochastic_scalars,).  Only the first ``d``
+        components are used for E-field reconstruction; the remaining components
+        encode log permeability scalars and are handled separately.
+
         Args:
-            xi_prime: shape (d,)
+            xi_prime: shape (effective_d,) or (d,)
         Returns:
             E_field: shape (n_z, n_x)
         """
+        xi_E = xi_prime[:self.d]
         if self.basis_type == 'polynomial':
-            return self._reconstruct_field_polynomial(xi_prime)
+            return self._reconstruct_field_polynomial(xi_E)
         elif self.basis_type == 'kl':
-            return self._reconstruct_field_kl(xi_prime)
+            return self._reconstruct_field_kl(xi_E)
         elif self.basis_type == 'dct':
-            return self._reconstruct_field_dct(xi_prime)
+            return self._reconstruct_field_dct(xi_E)
         else:
             raise ValueError(
                 f"Unknown basis_type: {self.basis_type!r}. "
@@ -264,7 +422,10 @@ class ReducedLUT:
     def precompute_responses(self, field_generator=None):
         """
         Run Biot solver for each grid point using basis-function field reconstruction.
-        k_h and k_v are taken from config (fixed material permeabilities).
+
+        k_h and k_v are taken from config (fixed material permeabilities) unless
+        the corresponding stochastic flag is set, in which case they are extracted
+        from the scalar part of xi_prime (columns d and d+1 of grid_points).
         """
         if self.grid_points is None:
             raise RuntimeError("Call generate_grid() first")
@@ -274,7 +435,16 @@ class ReducedLUT:
             if j % 100 == 0:
                 logger.info(f"LUT precompute: {j}/{n}")
             E_field = self._reconstruct_field(xi_prime)
-            Y = self.solver.run(E_field, self.k_h, self.k_v)
+            # Extract per-point permeabilities from stochastic scalar dimensions
+            if self.k_h_stochastic:
+                k_h = float(np.exp(xi_prime[self.d]))
+            else:
+                k_h = self.k_h
+            if self.k_v_stochastic:
+                k_v = float(np.exp(xi_prime[self.d + int(self.k_h_stochastic)]))
+            else:
+                k_v = self.k_v
+            Y = self.solver.run(E_field, k_h, k_v)
             self.responses[j] = Y
         logger.info(f"LUT precomputation complete: {n} points")
         return self.responses
@@ -306,7 +476,7 @@ class ReducedLUT:
         X_val = self.grid_points[val_idx]
         Y_val = self.responses[val_idx]
 
-        # Apply DCT output transform when output_representation='dct'
+        # Apply output transform when output_representation != 'direct'
         if self.output_representation == 'dct':
             Y_train_fit = self._to_dct_space(Y_train)
             Y_val_fit = self._to_dct_space(Y_val)
@@ -314,6 +484,22 @@ class ReducedLUT:
             logger.info(
                 f"Surrogate output: DCT basis with {output_dim} modes "
                 f"(n_x={self.n_x})"
+            )
+        elif self.output_representation == 'poly':
+            Y_train_fit = self._to_poly_space(Y_train)
+            Y_val_fit = self._to_poly_space(Y_val)
+            output_dim = self.n_output_modes
+            logger.info(
+                f"Surrogate output: polynomial basis with {output_dim} terms "
+                f"(degree={output_dim - 1}, n_x={self.n_x})"
+            )
+        elif self.output_representation == 'bspline':
+            Y_train_fit = self._to_bspline_space(Y_train)
+            Y_val_fit = self._to_bspline_space(Y_val)
+            output_dim = self.n_output_modes
+            logger.info(
+                f"Surrogate output: B-spline basis with {output_dim} functions "
+                f"(degree={self.bspline_degree}, n_x={self.n_x})"
             )
         else:
             Y_train_fit = Y_train
@@ -328,7 +514,7 @@ class ReducedLUT:
             batch_size = surrogate_cfg.get('batch_size', 64)
 
             model = PhysicsDrivenMappingNN(
-                input_dim=self.d, output_dim=output_dim,
+                input_dim=self.effective_d, output_dim=output_dim,
                 hidden_dim=hidden_dim, n_blocks=n_blocks
             )
             model.fit(X_train, Y_train_fit, X_val, Y_val_fit,
@@ -340,7 +526,7 @@ class ReducedLUT:
             phase2_pce_cfg = (self.config.get('phase2') or {}).get('pce') or {}
             degree = phase2_pce_cfg.get('order', surrogate_cfg.get('basis_order', 3))
             model = PolynomialChaosExpansion(
-                degree=degree, n_inputs=self.d, n_outputs=output_dim
+                degree=degree, n_inputs=self.effective_d, n_outputs=output_dim
             )
             model.fit(X_train, Y_train_fit)
             self.surrogate = model
@@ -384,7 +570,7 @@ class ReducedLUT:
 
         cfg = {
             'surrogate_type': surrogate_type,
-            'input_dim': self.d,
+            'input_dim': self.effective_d,
             'output_dim': int(self.responses.shape[1]),
             'n_grid_points': int(len(self.grid_points)),
             'r2_validation': float(r2_val) if r2_val is not None else None,
@@ -395,6 +581,11 @@ class ReducedLUT:
             'basis_order': self.basis_order,
             'output_representation': self.output_representation,
             'n_output_modes': self.n_output_modes,
+            'bspline_degree': self.bspline_degree,
+            'k_h_stochastic': self.k_h_stochastic,
+            'k_v_stochastic': self.k_v_stochastic,
+            'n_stochastic_scalars': self.n_stochastic_scalars,
+            'effective_d': self.effective_d,
         }
         with open(os.path.join(self.output_dir, 'config.json'), 'w', encoding='utf-8') as f:
             json.dump(cfg, f, indent=2)
@@ -460,6 +651,14 @@ class ReducedLUT:
             saved_modes = meta.get('n_output_modes')
             if saved_modes is not None:
                 self.n_output_modes = int(saved_modes)
+            saved_bspline_degree = meta.get('bspline_degree')
+            if saved_bspline_degree is not None:
+                self.bspline_degree = int(saved_bspline_degree)
+            # Restore stochastic scalar settings (default to 0 for old LUTs)
+            self.k_h_stochastic = bool(meta.get('k_h_stochastic', False))
+            self.k_v_stochastic = bool(meta.get('k_v_stochastic', False))
+            self.n_stochastic_scalars = int(meta.get('n_stochastic_scalars', 0))
+            self.effective_d = int(meta.get('effective_d', self.d))
 
         logger.info(f"Loaded LUT surrogate from {self.output_dir}")
 
@@ -493,6 +692,10 @@ class ReducedLUT:
         Y_raw = self.surrogate.predict(xi_prime)
         if self.output_representation == 'dct':
             Y = self._from_dct_space(Y_raw)
+        elif self.output_representation == 'poly':
+            Y = self._from_poly_space(Y_raw)
+        elif self.output_representation == 'bspline':
+            Y = self._from_bspline_space(Y_raw)
         else:
             Y = Y_raw
         return Y[0] if scalar else Y

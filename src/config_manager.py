@@ -12,6 +12,7 @@ _ALLOWED = {
     'dimension_reducer.basis_type': {'polynomial', 'kl', 'dct'},
     'dimension_reducer.mode': {'identity', 'learned'},
     'surrogate.type': {'nn', 'pce'},
+    'surrogate.output_representation': {'direct', 'dct', 'poly', 'bspline'},
     'random_field.field_basis': {'kl', 'dct'},
 }
 
