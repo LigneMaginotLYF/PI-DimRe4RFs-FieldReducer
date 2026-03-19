@@ -137,6 +137,19 @@ class ReducedLUT:
             f"k_h_stochastic={self.k_h_stochastic}",
             f"k_v_stochastic={self.k_v_stochastic}",
         ]
+        # Include parameters that affect surrogate interface/behavior but were
+        # previously omitted from the hash. This ensures that cached surrogates
+        # trained with different spline settings or permeability ranges do not
+        # collide.
+        if getattr(self, "output_representation", None) == "bspline":
+            bspline_degree = getattr(self, "bspline_degree", None)
+            parts.append(f"bspline_degree={bspline_degree}")
+        if getattr(self, "k_h_stochastic", False):
+            k_h_range = getattr(self, "k_h_range", None)
+            parts.append(f"k_h_range={k_h_range}")
+        if getattr(self, "k_v_stochastic", False):
+            k_v_range = getattr(self, "k_v_range", None)
+            parts.append(f"k_v_range={k_v_range}")
         if self.basis_type == 'kl':
             parts += [
                 f"nu_ref={rf_cfg.get('nu_ref', 1.5)}",
