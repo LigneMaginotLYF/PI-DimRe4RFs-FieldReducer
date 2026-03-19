@@ -569,20 +569,23 @@ class ReducedLUT:
                 f"(n_x={self.n_x})"
             )
         elif self.output_representation == 'poly':
-            Y_train_fit = self._to_poly_space(Y_train)
-            Y_val_fit = self._to_poly_space(Y_val)
-            output_dim = self.n_output_modes
-            logger.info(
-                f"Surrogate output: polynomial basis with {output_dim} terms "
-                f"(degree={output_dim - 1}, n_x={self.n_x})"
+            raise NotImplementedError(
+                "Surrogate training with output_representation='poly' is not "
+                "currently supported for Phase-3 reducer training: the surrogate "
+                "would output polynomial coefficients, but downstream "
+                "fit_with_surrogate() only reconstructs node-space for 'direct' "
+                "and 'dct'. Either extend fit_with_surrogate() to handle 'poly' "
+                "by reconstructing node-space, or train with 'direct'/'dct'."
             )
         elif self.output_representation == 'bspline':
-            Y_train_fit = self._to_bspline_space(Y_train)
-            Y_val_fit = self._to_bspline_space(Y_val)
-            output_dim = self.n_output_modes
-            logger.info(
-                f"Surrogate output: B-spline basis with {output_dim} functions "
-                f"(degree={self.bspline_degree}, n_x={self.n_x})"
+            raise NotImplementedError(
+                "Surrogate training with output_representation='bspline' is not "
+                "currently supported for Phase-3 reducer training: the surrogate "
+                "would output B-spline coefficients, but downstream "
+                "fit_with_surrogate() only reconstructs node-space for 'direct' "
+                "and 'dct'. Either extend fit_with_surrogate() to handle "
+                "'bspline' by reconstructing node-space, or train with "
+                "'direct'/'dct'."
             )
         else:
             Y_train_fit = Y_train
