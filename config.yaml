@@ -281,6 +281,13 @@ phase3:
   pce:
     order: 3   # polynomial chaos expansion degree
 
+  # Which Phase-2 surrogate type to load when training Phase 3.
+  # Defaults to phase2.surrogate_type if not set.  Override here when you
+  # want to train the Phase-3 reducer against a specific Phase-2 artifact
+  # (e.g. run "python scripts/train_phase2.py" first with surrogate_type=nn,
+  # then run Phase 3 with surrogate_type_to_use: "nn").
+  # surrogate_type_to_use: "nn"
+
 validation:
   train_fraction: 0.6
   val_fraction: 0.2

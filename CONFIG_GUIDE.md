@@ -386,6 +386,7 @@ These keys take precedence over `dimension_reducer.types` / `surrogate.type`.
 | `reducer_type` | str | *(from `surrogate.type`)* | Reducer type for Phase 3. `"nn"` or `"pce"`. |
 | `reducer_types` | list[str] | *(from `dimension_reducer.types`)* | Train multiple reducer types simultaneously. |
 | `pce.order` | int | 3 | PCE polynomial degree for Phase-3 (only when `reducer_type = "pce"`). |
+| `surrogate_type_to_use` | str | *(from `phase2.surrogate_type`)* | Which Phase-2 surrogate artifact to load for Phase-3 training. Defaults to the value of `phase2.surrogate_type`. Set explicitly when running Phase 3 with a pre-trained Phase-2 surrogate of a specific type (e.g. after running `scripts/train_phase2.py` independently). |
 
 > **Why separate?**  Phase-2 learns a forward map from low-dimensional ξ' to
 > settlement profiles — typically a smooth, well-conditioned regression for which
@@ -394,6 +395,12 @@ These keys take precedence over `dimension_reducer.types` / `surrogate.type`.
 > model capacity.  Coupling the two types via a single `surrogate.type` key hides
 > this distinction and can cause Phase-3 to silently use PCE (very slow) when
 > only Phase-2 was intended to be PCE.
+>
+> **Important:** Before this fix, Phase-3 would incorrectly try to load a Phase-2
+> surrogate whose *file name* matched the *reducer* type (e.g. `surrogate_pce.pkl`
+> for a PCE reducer), even when the Phase-2 LUT was trained as a NN surrogate.
+> `surrogate_type_to_use` makes this explicit and prevents stale/mismatched
+> surrogate artifacts from silently producing bad Phase-3 results.
 
 ---
 
