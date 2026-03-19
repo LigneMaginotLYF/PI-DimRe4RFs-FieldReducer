@@ -23,11 +23,22 @@ When `random_field.field_basis: "dct"`, Phase 1 uses a **fixed 2D DCT-II basis**
 
 **Per-sample mean variation** (`E_ref_sampling: true`, DCT only): each sample draws a scaling factor `f ~ Uniform(E_ref_factor_range)` and encodes the mean shift directly into the DC DCT coefficient (index 0, mode (0,0)).  This means the ξ_E vector alone carries the mean information—no extra input feature is required.
 
-### Phase 2 – Smooth DCT surrogate output
+### Phase 2 – Smooth DCT/poly/bspline surrogate output
 
-Set `surrogate.output_representation: "dct"` (and `n_output_modes: 8`) to train the Phase-2 surrogate to predict **DCT coefficients** of the settlement profile Y(x) rather than raw node values.  At inference, `ReducedLUT.predict()` applies the inverse DCT to return the full profile.  The truncated DCT basis constrains predictions to smooth (band-limited) functions, preventing the oscillatory artefacts that can appear with direct node-by-node prediction.
+Set `surrogate.output_representation` to control how the surrogate predicts the settlement profile Y(x):
 
-A **roughness diagnostic** (mean ‖ΔY‖) is logged at Phase-2 evaluation alongside R² and RMSE to make any remaining oscillations visible.
+| Value | Description |
+|-------|-------------|
+| `"direct"` (default) | Surrogate predicts raw Y(x) values node-by-node. |
+| `"dct"` | Surrogate predicts `n_output_modes` DCT-II coefficients; inverse DCT at inference. Smooth, band-limited predictions. |
+| `"poly"` | Surrogate predicts `n_output_modes` polynomial coefficients (degree = n_output_modes − 1); `np.polyfit`/`np.polyval` based. |
+| `"bspline"` | Surrogate predicts `n_output_modes` B-spline coefficients of degree `bspline_degree` (default 3); `scipy.interpolate` based. |
+
+A **roughness diagnostic** (mean ‖ΔY‖) and **normalized RMSE** (RMSE/range and RMSE/std) are logged at Phase-2 evaluation alongside R² and RMSE.
+
+### Phase 1 – Stochastic permeability scalars
+
+Set `stochastic_inputs.k_h: true` and/or `stochastic_inputs.k_v: true` to sample per-sample horizontal/vertical permeabilities from a log-uniform range.  The log values are appended to `X_train.npy` as extra input features, increasing `X_train` width by 1 per enabled scalar.  The LUT grid is extended accordingly (`effective_d = d + n_stochastic_scalars`).
 
 ### Phase 4 – Direct-physics qualitative plots
 
@@ -64,6 +75,23 @@ Additional CLI options:
 --phases 1,2,3,4       Comma-separated phases to run (default: all four)
 --n-samples N          Override number of training samples
 --surrogate-type TYPE  Override surrogate type: nn or pce
+```
+
+### Decoupled Phase-1 + Phase-2 only
+
+To run only Phase 1 (dataset generation) and Phase 2 (LUT surrogate training) and
+save all Phase-2 artefacts without proceeding to Phase 3/4:
+
+```bash
+python scripts/train_phase2.py --preset presets/stage1_d1_polynomial.yaml
+```
+
+Options:
+```
+--config PATH          Base config (default: config.yaml)
+--preset PATH          Optional preset YAML
+--output-dir DIR       Artefact directory
+--seed N               Override dataset.seed
 ```
 
 ### Fast / Smoke Run

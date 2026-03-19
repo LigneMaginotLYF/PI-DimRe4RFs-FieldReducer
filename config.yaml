@@ -194,18 +194,28 @@ surrogate:
   # types: ["nn", "pce"]
 
   # Output representation for the Phase-2 surrogate.
-  # Allowed values: "direct" | "dct"
-  # "direct" (default): surrogate predicts full settlement profile Y(x) directly.
-  # "dct"             : surrogate predicts n_output_modes DCT-II coefficients of
-  #                     the settlement profile.  predict() applies inverse DCT to
-  #                     return full Y(x).  Smoother (C²) predictions due to truncated
-  #                     DCT basis; helps avoid oscillatory artifacts.
+  # Allowed values: "direct" | "dct" | "poly" | "bspline"
+  # "direct"  (default): surrogate predicts full settlement profile Y(x) directly.
+  # "dct"              : surrogate predicts n_output_modes DCT-II coefficients of
+  #                      the settlement profile.  predict() applies inverse DCT to
+  #                      return full Y(x).  Smoother (C²) predictions due to truncated
+  #                      DCT basis; helps avoid oscillatory artifacts.
+  # "poly"             : surrogate predicts n_output_modes polynomial coefficients
+  #                      (degree = n_output_modes - 1) fitted to Y(x) via least squares.
+  # "bspline"          : surrogate predicts n_output_modes B-spline basis coefficients
+  #                      fitted to Y(x).  Spline degree controlled by bspline_degree.
   output_representation: "direct"
 
-  # Number of 1D DCT modes to use for the surrogate output.
-  # Only used when output_representation = "dct".
-  # Smaller values give smoother predictions; larger values retain more detail.
+  # Number of output modes / coefficients for transformed output representations.
+  # Used by output_representation = "dct" | "poly" | "bspline".
+  # For "dct":     number of DCT-II modes (fewer → smoother predictions).
+  # For "poly":    number of polynomial terms (= degree + 1).
+  # For "bspline": number of B-spline basis functions (must be > bspline_degree).
   n_output_modes: 8
+
+  # B-spline degree used when output_representation = "bspline".
+  # Must satisfy n_output_modes > bspline_degree.  Default: 3 (cubic splines).
+  bspline_degree: 3
 
 phase4:
   # Use direct Biot solver (not surrogate) for the 5 settlement comparison plots.
@@ -275,3 +285,15 @@ validation:
   train_fraction: 0.6
   val_fraction: 0.2
   test_fraction: 0.2
+
+stochastic_inputs:
+  # Young's modulus random field is always stochastic (not configurable here).
+  # Optional stochastic scalars appended to X_train.npy feature vector.
+  k_h: false      # horizontal permeability per-sample random scalar
+  k_v: false      # vertical permeability per-sample random scalar
+
+  # Sampling ranges in natural units [m²] when the scalar is stochastic.
+  # Values are stored as log(k) in X_train.npy for numerical stability.
+  # Sample log uniformly in [log(k_min), log(k_max)]; actual k = exp(log_k).
+  k_h_range: [1.0e-13, 1.0e-10]
+  k_v_range: [1.0e-13, 1.0e-10]

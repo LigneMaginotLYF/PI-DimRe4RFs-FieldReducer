@@ -1823,5 +1823,201 @@ class TestPolynomialBasis(unittest.TestCase):
             )
 
 
+class TestPhase2MetricDiagnostics(unittest.TestCase):
+    """Test that Phase-2 evaluation metrics are computed consistently."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix='pi_dimre_metric_')
+        self._orig_cwd = os.getcwd()
+        os.chdir(self.tmp_dir)
+
+    def tearDown(self):
+        os.chdir(self._orig_cwd)
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def test_metric_consistency_direct(self):
+        """For direct output representation, RMSE/R² should be coherent."""
+        from src.training_pipeline import TrainingPipeline
+        config = _make_smoke_config()
+        config['surrogate']['output_representation'] = 'direct'
+        pipeline = TrainingPipeline(config, output_dir='results/metric_direct')
+        pipeline.orchestrate(phases=[1, 2])
+
+        import json
+        with open('models/reduced_lut/pce/evaluation/metrics.json') as f:
+            metrics = json.load(f)
+
+        self.assertIn('r2', metrics)
+        self.assertIn('rmse', metrics)
+        self.assertIn('nrmse_std', metrics)
+        # All scalar metrics must be finite
+        self.assertTrue(np.isfinite(metrics['rmse']))
+        self.assertTrue(np.isfinite(metrics['nrmse_range']))
+        self.assertTrue(np.isfinite(metrics['nrmse_std']))
+        # Coherence: nrmse_std < 1 means RMSE < 1 std — reasonable for a fitted surrogate
+        self.assertLess(metrics['nrmse_std'], 1.0,
+                        "RMSE exceeds one standard deviation of the test set — "
+                        "surrogate quality is unexpectedly poor")
+
+    def test_metric_consistency_dct(self):
+        """For DCT output representation, metrics should be in node-space and coherent."""
+        from src.training_pipeline import TrainingPipeline
+        config = _make_smoke_config()
+        config['surrogate']['output_representation'] = 'dct'
+        config['surrogate']['n_output_modes'] = 4
+        pipeline = TrainingPipeline(config, output_dir='results/metric_dct')
+        pipeline.orchestrate(phases=[1, 2])
+
+        import json
+        with open('models/reduced_lut/pce/evaluation/metrics.json') as f:
+            metrics = json.load(f)
+
+        self.assertIn('rmse', metrics)
+        self.assertIn('nrmse_std', metrics)
+        self.assertTrue(np.isfinite(metrics['rmse']))
+        # Coherence: nrmse_std < 1 means RMSE < std(Y_test)
+        self.assertLess(metrics['nrmse_std'], 1.0,
+                        "RMSE exceeds one standard deviation of the test set — "
+                        "DCT surrogate quality is unexpectedly poor")
+
+
+class TestStochasticPermeability(unittest.TestCase):
+    """Test stochastic k_h and k_v feature appending."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix='pi_dimre_perm_')
+        self._orig_cwd = os.getcwd()
+        os.chdir(self.tmp_dir)
+
+    def tearDown(self):
+        os.chdir(self._orig_cwd)
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def _base_config(self):
+        cfg = _make_smoke_config()
+        return cfg
+
+    def test_no_stochastic_scalars_baseline(self):
+        """Without stochastic_inputs, X_train has shape (n, n_terms_E)."""
+        from src.training_pipeline import TrainingPipeline
+        config = self._base_config()
+        pipeline = TrainingPipeline(config, output_dir='results/perm_baseline')
+        X, Y = pipeline.phase1_generate_dataset()
+        # 5 terms, no extra features
+        self.assertEqual(X.shape[1], 5)
+
+    def test_k_h_stochastic_appends_feature(self):
+        """With k_h stochastic, X_train has one extra column."""
+        from src.training_pipeline import TrainingPipeline
+        config = self._base_config()
+        config['stochastic_inputs'] = {
+            'k_h': True, 'k_v': False,
+            'k_h_range': [1e-13, 1e-10],
+        }
+        pipeline = TrainingPipeline(config, output_dir='results/perm_kh')
+        X, Y = pipeline.phase1_generate_dataset()
+        # 5 terms + 1 log_k_h
+        self.assertEqual(X.shape[1], 6)
+
+    def test_both_stochastic_appends_two_features(self):
+        """With both k_h and k_v stochastic, X_train has two extra columns."""
+        from src.training_pipeline import TrainingPipeline
+        config = self._base_config()
+        config['stochastic_inputs'] = {
+            'k_h': True, 'k_v': True,
+            'k_h_range': [1e-13, 1e-10],
+            'k_v_range': [1e-13, 1e-10],
+        }
+        pipeline = TrainingPipeline(config, output_dir='results/perm_both')
+        X, Y = pipeline.phase1_generate_dataset()
+        # 5 terms + 2 log permeabilities
+        self.assertEqual(X.shape[1], 7)
+
+    def test_k_h_k_v_stochastic_full_pipeline(self):
+        """Full pipeline with both k_h and k_v stochastic should complete without error."""
+        from src.training_pipeline import TrainingPipeline
+        config = self._base_config()
+        config['stochastic_inputs'] = {
+            'k_h': True, 'k_v': True,
+            'k_h_range': [1e-13, 1e-10],
+            'k_v_range': [1e-13, 1e-10],
+        }
+        pipeline = TrainingPipeline(config, output_dir='results/perm_pipeline')
+        metrics = pipeline.orchestrate(phases=[1, 2, 3, 4])
+        self.assertIn('r2', metrics)
+        # Feature layout check
+        X = np.load('data/X_train.npy')
+        self.assertEqual(X.shape[1], 7)  # 5 + 2
+
+
+class TestNewOutputBases(unittest.TestCase):
+    """Test new poly and bspline output representation forward/inverse round-trips."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp(prefix='pi_dimre_basis_')
+        self._orig_cwd = os.getcwd()
+        os.chdir(self.tmp_dir)
+
+    def tearDown(self):
+        os.chdir(self._orig_cwd)
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def test_poly_round_trip(self):
+        """Polynomial output: forward then inverse should approximately recover Y."""
+        from src.reduced_lut import ReducedLUT
+        from src.forward_solver_2d import BiotSolver2D
+        config = _make_smoke_config()
+        config['surrogate']['output_representation'] = 'poly'
+        config['surrogate']['n_output_modes'] = 5
+        solver = BiotSolver2D(config)
+        lut = ReducedLUT(config, solver, output_dir='models/reduced_lut')
+        rng = np.random.default_rng(0)
+        # Smooth synthetic Y profiles
+        x = np.linspace(0, 1, 8)
+        Y = np.vstack([np.sin(x + rng.uniform(0, 0.5)) for _ in range(5)])
+        coeffs = lut._to_poly_space(Y)
+        Y_rec = lut._from_poly_space(coeffs)
+        self.assertEqual(Y_rec.shape, Y.shape)
+        # Allow ~50% round-trip error for polynomial fitting (loose tolerance)
+        rel_err = np.mean(np.abs(Y_rec - Y)) / (np.mean(np.abs(Y)) + 1e-15)
+        self.assertLess(rel_err, 0.5)
+
+    def test_bspline_round_trip(self):
+        """B-spline output: forward then inverse should approximately recover Y."""
+        from src.reduced_lut import ReducedLUT
+        from src.forward_solver_2d import BiotSolver2D
+        config = _make_smoke_config()
+        config['surrogate']['output_representation'] = 'bspline'
+        config['surrogate']['n_output_modes'] = 6
+        solver = BiotSolver2D(config)
+        lut = ReducedLUT(config, solver, output_dir='models/reduced_lut')
+        rng = np.random.default_rng(0)
+        x = np.linspace(0, 1, 8)
+        Y = np.vstack([np.sin(x + rng.uniform(0, 0.5)) for _ in range(5)])
+        coeffs = lut._to_bspline_space(Y)
+        Y_rec = lut._from_bspline_space(coeffs)
+        self.assertEqual(Y_rec.shape, Y.shape)
+        rel_err = np.mean(np.abs(Y_rec - Y)) / (np.mean(np.abs(Y)) + 1e-15)
+        self.assertLess(rel_err, 0.5)
+
+    def test_poly_smoke_phase2(self):
+        """Phase 2 with poly output representation completes without error."""
+        from src.training_pipeline import TrainingPipeline
+        config = _make_smoke_config()
+        config['surrogate']['output_representation'] = 'poly'
+        config['surrogate']['n_output_modes'] = 4
+        pipeline = TrainingPipeline(config, output_dir='results/poly_phase2')
+        pipeline.orchestrate(phases=[1, 2])
+
+    def test_bspline_smoke_phase2(self):
+        """Phase 2 with bspline output representation completes without error."""
+        from src.training_pipeline import TrainingPipeline
+        config = _make_smoke_config()
+        config['surrogate']['output_representation'] = 'bspline'
+        config['surrogate']['n_output_modes'] = 6
+        pipeline = TrainingPipeline(config, output_dir='results/bspline_phase2')
+        pipeline.orchestrate(phases=[1, 2])
+
+
 if __name__ == '__main__':
     unittest.main()

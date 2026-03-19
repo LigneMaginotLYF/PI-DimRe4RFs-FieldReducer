@@ -240,6 +240,14 @@ class TrainingPipeline:
         logE_std = rf_cfg.get('logE_std', rf_cfg.get('field_fluctuation_scale', 1.0))
         field_basis = rf_cfg.get('field_basis', 'kl')
 
+        # Stochastic permeability scalars
+        stoch_cfg = self.config.get('stochastic_inputs') or {}
+        k_h_stochastic = bool(stoch_cfg.get('k_h', False))
+        k_v_stochastic = bool(stoch_cfg.get('k_v', False))
+        k_h_range = stoch_cfg.get('k_h_range', [1e-13, 1e-10])
+        k_v_range = stoch_cfg.get('k_v_range', [1e-13, 1e-10])
+        n_stochastic = int(k_h_stochastic) + int(k_v_stochastic)
+
         # Per-sample E_ref sampling (DCT basis only): encodes mean shift in DC coefficient
         e_ref_sampling = rf_cfg.get('E_ref_sampling', False)
         e_ref_factor_range = rf_cfg.get('E_ref_factor_range', [0.5, 1.5])
@@ -269,8 +277,18 @@ class TrainingPipeline:
         solver = self._get_solver()
         field_gen = self._get_field_generator()
 
-        X_train = np.zeros((n_samples, n_terms))
+        X_train = np.zeros((n_samples, n_terms + n_stochastic))
         Y_train = np.zeros((n_samples, n_x))
+
+        if n_stochastic > 0:
+            logger.info(
+                f"Phase 1: stochastic permeabilities -- "
+                f"k_h={'log-uniform' if k_h_stochastic else 'fixed'} "
+                f"k_v={'log-uniform' if k_v_stochastic else 'fixed'} "
+                f"| feature layout: cols 0..{n_terms - 1}=xi_E"
+                + (f", col {n_terms}=norm_log_k_h (in [-1,1])" if k_h_stochastic else "")
+                + (f", col {n_terms + int(k_h_stochastic)}=norm_log_k_v (in [-1,1])" if k_v_stochastic else "")
+            )
 
         # Trend in log-E space (optional, both DCT and KL paths)
         trend_cfg = rf_cfg.get('trend') or {}
@@ -310,8 +328,32 @@ class TrainingPipeline:
                     rng=rng,
                     trend_cfg=trend_cfg if trend_enabled else None,
                 )
-            Y = solver.run(E_field, k_h, k_v)
-            X_train[i] = xi_E
+            X_train[i, :n_terms] = xi_E
+            # Sample stochastic permeability scalars and append to feature vector.
+            # Stored as standardized values in [-1, 1] (normalized log-space) so that
+            # PCE Hermite/Legendre bases and NN inputs remain O(1) magnitude.
+            stoch_cols = []
+            if k_h_stochastic:
+                log_k_h = rng.uniform(np.log(k_h_range[0]), np.log(k_h_range[1]))
+                k_h_sample = np.exp(log_k_h)
+                norm_log_k_h = 2.0 * (log_k_h - np.log(k_h_range[0])) / (
+                    np.log(k_h_range[1]) - np.log(k_h_range[0])
+                ) - 1.0
+                stoch_cols.append(norm_log_k_h)
+            else:
+                k_h_sample = k_h
+            if k_v_stochastic:
+                log_k_v = rng.uniform(np.log(k_v_range[0]), np.log(k_v_range[1]))
+                k_v_sample = np.exp(log_k_v)
+                norm_log_k_v = 2.0 * (log_k_v - np.log(k_v_range[0])) / (
+                    np.log(k_v_range[1]) - np.log(k_v_range[0])
+                ) - 1.0
+                stoch_cols.append(norm_log_k_v)
+            else:
+                k_v_sample = k_v
+            if stoch_cols:
+                X_train[i, n_terms:] = stoch_cols
+            Y = solver.run(E_field, k_h_sample, k_v_sample)
             Y_train[i] = Y
 
         os.makedirs(os.path.dirname(x_path) if os.path.dirname(x_path) else '.', exist_ok=True)
@@ -430,7 +472,42 @@ class TrainingPipeline:
         Y_test = lut.responses[test_idx]
 
         Y_pred = lut.predict(X_test)
+
+        # Shape check: predictions must match ground-truth dimensions
+        if Y_pred.shape != Y_test.shape:
+            raise ValueError(
+                f"Shape mismatch in Phase-2 evaluation: "
+                f"Y_pred.shape={Y_pred.shape} != Y_test.shape={Y_test.shape}"
+            )
+
         metrics = Validation.compute_metrics(Y_pred, Y_test)
+
+        # --- Per-output diagnostics ---
+        y_mean = float(np.mean(Y_test))
+        y_std = float(np.std(Y_test))
+        y_max = float(np.max(Y_test))
+        y_min = float(np.min(Y_test))
+        y_range = y_max - y_min
+        rmse = metrics['rmse']
+        # Normalized RMSE metrics
+        nrmse_range = float(rmse / y_range) if y_range > 1e-30 else float('inf')
+        nrmse_std = float(rmse / y_std) if y_std > 1e-30 else float('inf')
+        metrics['nrmse_range'] = nrmse_range
+        metrics['nrmse_std'] = nrmse_std
+        metrics['y_mean'] = y_mean
+        metrics['y_std'] = y_std
+        metrics['y_min'] = y_min
+        metrics['y_max'] = y_max
+
+        logger.info(
+            f"Phase 2 [{surrogate_type}] global Y_test diagnostics: "
+            f"mean={y_mean:.4e}, std={y_std:.4e}, "
+            f"min={y_min:.4e}, max={y_max:.4e}"
+        )
+        logger.info(
+            f"Phase 2 [{surrogate_type}] normalized RMSE: "
+            f"RMSE/range={nrmse_range:.4f}, RMSE/std={nrmse_std:.4f}"
+        )
 
         # Roughness metric: mean L2 norm of first differences ||ΔY||
         roughness_gt = float(np.mean(np.sqrt(np.mean(np.diff(Y_test, axis=1) ** 2, axis=1))))
@@ -531,7 +608,7 @@ class TrainingPipeline:
 
         n_kl = X_train.shape[1]
         input_dim = n_kl
-        output_dim = red_cfg.get('d', 1)  # output dimension matches reduced space
+        output_dim = reduced_lut.effective_d  # d (E-dims) + n_stochastic_scalars
 
         # Identity mapping mode: bypass learned reducer
         reducer_mode = red_cfg.get('mode', 'learned')
@@ -603,6 +680,7 @@ class TrainingPipeline:
                 output_representation=reduced_lut.output_representation,
                 n_output_modes=reduced_lut.n_output_modes,
                 n_nodes_x=reduced_lut.n_x,
+                bspline_degree=reduced_lut.bspline_degree,
             )
         else:
             from src.mapping_learner_pce import PolynomialChaosExpansion
@@ -621,7 +699,8 @@ class TrainingPipeline:
                                        colloc_idx=colloc_idx,
                                        output_representation=reduced_lut.output_representation,
                                        n_output_modes=reduced_lut.n_output_modes,
-                                       n_nodes_x=reduced_lut.n_x)
+                                       n_nodes_x=reduced_lut.n_x,
+                                       bspline_degree=reduced_lut.bspline_degree)
         return reducer
 
     def phase4_evaluate(self, reducer, reduced_lut, X_test, Y_test):
@@ -778,14 +857,23 @@ class TrainingPipeline:
         try:
             solver = self._get_solver()
             mat_cfg = self.config.get('material') or {}
-            k_h = mat_cfg.get('permeability_h', 1.0e-12)
-            k_v = mat_cfg.get('permeability_v', 1.0e-12)
+            k_h_default = mat_cfg.get('permeability_h', 1.0e-12)
+            k_v_default = mat_cfg.get('permeability_v', 1.0e-12)
             n = len(xi_prime_samples)
             sol_cfg = self.config.get('solver') or {}
             n_x = sol_cfg.get('n_nodes_x', 20)
             Y_direct = np.zeros((n, n_x))
             for i, xi in enumerate(xi_prime_samples):
                 E_field = reduced_lut._reconstruct_field(xi)
+                # Extract permeabilities from stochastic scalar dimensions if present
+                if reduced_lut.k_h_stochastic:
+                    k_h = float(np.exp(xi[reduced_lut.d]))
+                else:
+                    k_h = k_h_default
+                if reduced_lut.k_v_stochastic:
+                    k_v = float(np.exp(xi[reduced_lut.d + int(reduced_lut.k_h_stochastic)]))
+                else:
+                    k_v = k_v_default
                 Y_direct[i] = solver.run(E_field, k_h, k_v)
             return Y_direct
         except (ValueError, RuntimeError, ArithmeticError, np.linalg.LinAlgError) as exc:
@@ -865,14 +953,16 @@ class TrainingPipeline:
         for i in range(n):
             nu = rng.uniform(*nu_range) if nu_sampling else nu_ref
             length_scale = rng.uniform(*ls_range) if ls_sampling else ls_ref
+            # Slice to first n_terms to drop any appended stochastic scalar features
+            xi_E_row = X_test[i, :n_terms]
             if field_basis == 'dct':
-                # DCT: X_test[i] are the stored coefficients; reconstruct directly.
+                # DCT: X_test[i, :n_terms] are the stored coefficients; reconstruct directly.
                 E_field = field_gen.reconstruct_from_coefficients(
-                    X_test[i], E_ref=E_ref, logE_std=logE_std
+                    xi_E_row, E_ref=E_ref, logE_std=logE_std
                 )
             else:
                 E_field = field_gen.generate_field(
-                    X_test[i], nu, length_scale,
+                    xi_E_row, nu, length_scale,
                     n_terms=n_terms, E_ref=E_ref, logE_std=logE_std,
                 )
             Y_direct[i] = solver.run(E_field, k_h, k_v)
@@ -939,11 +1029,11 @@ class TrainingPipeline:
             length_scale = rng.uniform(*ls_range) if ls_sampling else ls_ref
             if field_basis == 'dct':
                 E_field = field_gen.reconstruct_from_coefficients(
-                    X_test[i], E_ref=E_ref, logE_std=logE_std
+                    X_test[i, :n_terms], E_ref=E_ref, logE_std=logE_std
                 )
             else:
                 E_field = field_gen.generate_field(
-                    X_test[i], nu, length_scale,
+                    X_test[i, :n_terms], nu, length_scale,
                     n_terms=n_terms, E_ref=E_ref, logE_std=logE_std,
                 )
             E_fields.append(E_field)
