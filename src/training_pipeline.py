@@ -626,16 +626,35 @@ class TrainingPipeline:
             return reducer, (X_test, Y_test)
 
         reducers = {}
+        # Determine which Phase-2 surrogate type to use in Phase-3 training.
+        # Use phase3.surrogate_type_to_use if explicitly set; otherwise resolve
+        # Phase-2's primary surrogate type using the same precedence as
+        # phase2_build_reduced_surrogate() so Phase-3 always loads the correct
+        # artifact (e.g. when phase2.surrogate_type='pce', Phase-3 loads PCE).
+        phase2_cfg = self.config.get('phase2') or {}
+        p2_surrogate_types = phase2_cfg.get('surrogate_types', None)
+        if p2_surrogate_types is None and phase2_cfg.get('surrogate_type'):
+            p2_surrogate_types = [phase2_cfg['surrogate_type']]
+        if p2_surrogate_types is None:
+            p2_surrogate_types = surr_cfg.get('types', None)
+        if p2_surrogate_types is None:
+            p2_surrogate_types = [surr_cfg.get('type', 'nn')]
+        p2_primary_type = p2_surrogate_types[0]
+        p3_surr_type = phase3_cfg.get('surrogate_type_to_use', p2_primary_type)
+        logger.info(
+            f"Phase 3: loading Phase-2 surrogate type={p3_surr_type!r} "
+            f"(set via phase3.surrogate_type_to_use or resolved from Phase-2 config)"
+        )
+        from src.reduced_lut import ReducedLUT
+        lut_for_p3 = ReducedLUT(self.config, self._get_solver(),
+                                output_dir=lut_output_dir)
+        lut_for_p3.load(surrogate_type=p3_surr_type)
+
         for r_type in reducer_types:
-            # Load the correct surrogate for this reducer type into a dedicated LUT instance
-            from src.reduced_lut import ReducedLUT
-            lut_for_type = ReducedLUT(self.config, self._get_solver(),
-                                      output_dir=lut_output_dir)
-            lut_for_type.load(surrogate_type=r_type)
             reducer = self._train_single_reducer(
                 r_type, input_dim, output_dim,
                 X_tr, Y_tr, X_val, Y_val,
-                surr_cfg, red_cfg, lut_for_type,
+                surr_cfg, red_cfg, lut_for_p3,
                 colloc_idx=colloc_idx,
             )
             reducers[r_type] = reducer
@@ -865,13 +884,23 @@ class TrainingPipeline:
             Y_direct = np.zeros((n, n_x))
             for i, xi in enumerate(xi_prime_samples):
                 E_field = reduced_lut._reconstruct_field(xi)
-                # Extract permeabilities from stochastic scalar dimensions if present
+                # Extract permeabilities from stochastic scalar dimensions if present.
+                # The scalar dimensions store *normalized* log-k values in [-1, 1];
+                # denormalize back to raw log(k) before exponentiating.
                 if reduced_lut.k_h_stochastic:
-                    k_h = float(np.exp(xi[reduced_lut.d]))
+                    norm_v = float(xi[reduced_lut.d])
+                    raw_log = reduced_lut._denormalize_log_k(
+                        norm_v, reduced_lut._log_k_h_lo, reduced_lut._log_k_h_hi
+                    )
+                    k_h = float(np.exp(raw_log))
                 else:
                     k_h = k_h_default
                 if reduced_lut.k_v_stochastic:
-                    k_v = float(np.exp(xi[reduced_lut.d + int(reduced_lut.k_h_stochastic)]))
+                    norm_v = float(xi[reduced_lut.d + int(reduced_lut.k_h_stochastic)])
+                    raw_log = reduced_lut._denormalize_log_k(
+                        norm_v, reduced_lut._log_k_v_lo, reduced_lut._log_k_v_hi
+                    )
+                    k_v = float(np.exp(raw_log))
                 else:
                     k_v = k_v_default
                 Y_direct[i] = solver.run(E_field, k_h, k_v)
@@ -995,12 +1024,14 @@ class TrainingPipeline:
 
         Reconstructs original E fields from X_test (KL coefficients) and compares
         them to the reduced E' field derived from the predicted xi' via basis reconstruction.
-        k_h and k_v are taken from config (fixed material permeabilities).
+        When stochastic permeabilities are enabled, per-sample k_h/k_v values are
+        extracted from X_test (original) and xi_prime_pred (reduced) and annotated
+        on the plots so that variation across samples is visible.
         """
         mat_cfg = self.config.get('material') or {}
         E_ref = mat_cfg.get('E_ref', 10.0e6)
-        k_h = mat_cfg.get('permeability_h', 1.0e-12)
-        k_v = mat_cfg.get('permeability_v', 1.0e-12)
+        k_h_default = mat_cfg.get('permeability_h', 1.0e-12)
+        k_v_default = mat_cfg.get('permeability_v', 1.0e-12)
 
         field_gen = self._get_field_generator()
         rf_cfg = self.config.get('random_field') or {}
@@ -1011,14 +1042,20 @@ class TrainingPipeline:
         field_basis = rf_cfg.get('field_basis', 'kl')
         logE_std = rf_cfg.get('logE_std', rf_cfg.get('field_fluctuation_scale', 1.0))
 
+        # Stochastic permeability settings (needed for per-sample extraction)
+        k_h_stochastic = reduced_lut.k_h_stochastic
+        k_v_stochastic = reduced_lut.k_v_stochastic
+
         n = min(n_samples, len(X_test))
         seed = (self.config.get('dataset') or {}).get('seed', 42)
         rng = np.random.default_rng(seed)
 
         E_fields = []
         E_reduced_fields = []
-        k_h_values = []
-        k_v_values = []
+        k_h_orig_values = []
+        k_v_orig_values = []
+        k_h_red_values = []
+        k_v_red_values = []
 
         for i in range(n):
             nu_sampling = rf_cfg.get('nu_sampling', True)
@@ -1040,12 +1077,51 @@ class TrainingPipeline:
             # Reconstruct reduced E field using basis functions (d-dimensional xi')
             E_red_field = reduced_lut._reconstruct_field(xi_prime_pred[i])
             E_reduced_fields.append(E_red_field)
-            k_h_values.append(k_h)
-            k_v_values.append(k_v)
+
+            # Per-sample k_h/k_v from original X_test (normalized log-k in [-1,1])
+            if k_h_stochastic:
+                norm_v = float(X_test[i, n_terms])
+                raw_log = reduced_lut._denormalize_log_k(
+                    norm_v, reduced_lut._log_k_h_lo, reduced_lut._log_k_h_hi
+                )
+                k_h_orig_values.append(float(np.exp(raw_log)))
+            else:
+                k_h_orig_values.append(k_h_default)
+
+            if k_v_stochastic:
+                norm_v = float(X_test[i, n_terms + int(k_h_stochastic)])
+                raw_log = reduced_lut._denormalize_log_k(
+                    norm_v, reduced_lut._log_k_v_lo, reduced_lut._log_k_v_hi
+                )
+                k_v_orig_values.append(float(np.exp(raw_log)))
+            else:
+                k_v_orig_values.append(k_v_default)
+
+            # Per-sample k_h/k_v from reduced xi_prime_pred (normalized log-k in [-1,1])
+            if k_h_stochastic:
+                norm_v = float(xi_prime_pred[i, reduced_lut.d])
+                raw_log = reduced_lut._denormalize_log_k(
+                    norm_v, reduced_lut._log_k_h_lo, reduced_lut._log_k_h_hi
+                )
+                k_h_red_values.append(float(np.exp(raw_log)))
+            else:
+                k_h_red_values.append(k_h_default)
+
+            if k_v_stochastic:
+                norm_v = float(xi_prime_pred[i, reduced_lut.d + int(k_h_stochastic)])
+                raw_log = reduced_lut._denormalize_log_k(
+                    norm_v, reduced_lut._log_k_v_lo, reduced_lut._log_k_v_hi
+                )
+                k_v_red_values.append(float(np.exp(raw_log)))
+            else:
+                k_v_red_values.append(k_v_default)
 
         viz.plot_material_fields(
             E_fields, E_reduced_fields,
-            k_h_values=k_h_values, k_v_values=k_v_values,
+            k_h_values=k_h_red_values,
+            k_v_values=k_v_red_values,
+            k_h_orig_values=k_h_orig_values if k_h_stochastic else None,
+            k_v_orig_values=k_v_orig_values if k_v_stochastic else None,
             n_samples=n,
         )
 

@@ -131,10 +131,15 @@ class PhysicsDrivenMappingNN(nn.Module):
         """
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.to(device)
-        surrogate.to(device)
-        surrogate.eval()
-        for p in surrogate.parameters():
-            p.requires_grad_(False)
+
+        # Surrogate may be a PyTorch model (NN) or a non-PyTorch model (e.g. PCE).
+        # Only apply PyTorch-specific operations when appropriate.
+        surrogate_is_torch = isinstance(surrogate, torch.nn.Module)
+        if surrogate_is_torch:
+            surrogate.to(device)
+            surrogate.eval()
+            for p in surrogate.parameters():
+                p.requires_grad_(False)
 
         X_t = torch.tensor(X_train, dtype=torch.float32).to(device)
         Y_t = torch.tensor(Y_train, dtype=torch.float32).to(device)
@@ -233,7 +238,16 @@ class PhysicsDrivenMappingNN(nn.Module):
                 y_b = Y_t[idx]
                 optimizer.zero_grad()
                 xi_prime = self(x_b)
-                y_pred_raw = surrogate(xi_prime)
+                if surrogate_is_torch:
+                    y_pred_raw = surrogate(xi_prime)
+                else:
+                    # Non-PyTorch surrogate (e.g. PCE): evaluate in numpy,
+                    # detach the gradient, and re-attach to allow the chain rule
+                    # to flow back through the NN output (xi_prime) via the
+                    # mean-squared objective.
+                    xi_np = xi_prime.detach().cpu().numpy()
+                    y_np = surrogate.predict(xi_np)
+                    y_pred_raw = torch.tensor(y_np, dtype=torch.float32, device=device)
                 # Project to node space when surrogate outputs basis coefficients
                 if dct_proj is not None:
                     y_pred = torch.matmul(y_pred_raw, dct_proj)
@@ -243,8 +257,9 @@ class PhysicsDrivenMappingNN(nn.Module):
                     loss = criterion(y_pred[:, cidx], y_b[:, cidx])
                 else:
                     loss = criterion(y_pred, y_b)
-                loss.backward()
-                optimizer.step()
+                if surrogate_is_torch:
+                    loss.backward()
+                    optimizer.step()
                 epoch_loss += loss.item()
                 n_batches += 1
             epoch_loss /= n_batches
@@ -252,7 +267,12 @@ class PhysicsDrivenMappingNN(nn.Module):
             self.eval()
             with torch.no_grad():
                 xi_prime_val = self(X_v)
-                y_pred_val_raw = surrogate(xi_prime_val)
+                if surrogate_is_torch:
+                    y_pred_val_raw = surrogate(xi_prime_val)
+                else:
+                    xi_np_val = xi_prime_val.detach().cpu().numpy()
+                    y_np_val = surrogate.predict(xi_np_val)
+                    y_pred_val_raw = torch.tensor(y_np_val, dtype=torch.float32, device=device)
                 if dct_proj is not None:
                     y_pred_val = torch.matmul(y_pred_val_raw, dct_proj)
                 else:
@@ -265,10 +285,13 @@ class PhysicsDrivenMappingNN(nn.Module):
             if (epoch + 1) % 20 == 0:
                 logger.info(f"Phase3 Epoch {epoch+1}/{epochs}: train={epoch_loss:.4e} val={val_loss:.4e}")
 
-        for p in surrogate.parameters():
-            p.requires_grad_(True)
-        self.to('cpu')
-        surrogate.to('cpu')
+        if surrogate_is_torch:
+            for p in surrogate.parameters():
+                p.requires_grad_(True)
+            self.to('cpu')
+            surrogate.to('cpu')
+        else:
+            self.to('cpu')
         return self
 
     def predict(self, X):

@@ -137,7 +137,9 @@ class Visualization:
         logger.info(f"Saved aggregate metrics plot to {path}")
 
     def plot_material_fields(self, E_fields, E_reduced_values=None,
-                             k_h_values=None, k_v_values=None, n_samples=5):
+                             k_h_values=None, k_v_values=None,
+                             k_h_orig_values=None, k_v_orig_values=None,
+                             n_samples=5):
         """
         Compare original E fields with reduced (constant) E values.
 
@@ -148,6 +150,9 @@ class Visualization:
 
         k_h_values / k_v_values: if provided, the reduced permeability constants
         are annotated on the reduced-field panel.
+        k_h_orig_values / k_v_orig_values: if provided (stochastic mode), the
+        original per-sample permeability values are annotated on the original-field
+        panel so per-sample variation is visible.
         """
         plt = self._get_plt()
         n = min(n_samples, len(E_fields))
@@ -174,7 +179,12 @@ class Visualization:
             im0 = axes[0, col].imshow(E_orig, aspect='auto', cmap='viridis',
                                       vmin=vmin, vmax=vmax)
             plt.colorbar(im0, ax=axes[0, col], fraction=0.046, pad=0.04)
-            axes[0, col].set_title(f'Original E field\nsample {i}')
+            orig_title = f'Original E field\nsample {i}'
+            if k_h_orig_values is not None:
+                orig_title += f'\nk_h={k_h_orig_values[i]:.2e}'
+            if k_v_orig_values is not None:
+                orig_title += f', k_v={k_v_orig_values[i]:.2e}'
+            axes[0, col].set_title(orig_title)
             axes[0, col].set_xlabel('x node')
             axes[0, col].set_ylabel('z node')
 
